@@ -1,0 +1,327 @@
+# Based on TGFastViewer by dunxuan.
+# Upstream: https://github.com/dunxuan/tgfastviewer
+# SPDX-License-Identifier: MIT
+#
+# MIT License
+#
+# Copyright (c) 2026 dunxuan
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import RequestCallback
+from java import jarray, jclass
+
+__id__ = "tgfastviewer_nagramxf"
+__name__ = "TG快点滑 · NagramXF"
+__description__ = "为聊天里的单张图片和视频加载附近的媒体，便于左右滑动。"
+__author__ = "dunxuan / NagramXF adaptation"
+__version__ = "1.0.1"
+__app_version__ = ">=12.10.1"
+
+TAG = "TgFastViewerNative"
+WINDOW = 64
+TIMEOUT_MS = 6000
+FILTERS = (
+    "PhotoVideo", "Document", "RoundVoice", "Url", "Music", "Gif",
+    "Photos", "Video", "Poll",
+)
+
+
+def declared_method(owner, name, arity):
+    matches = [method for method in owner.getDeclaredMethods()
+               if method.getName() == name and len(method.getParameterTypes()) == arity]
+    if len(matches) != 1:
+        raise RuntimeError(f"Cannot resolve {owner.getName()}.{name}/{arity}")
+    method = matches[0]
+    method.setAccessible(True)
+    return method
+
+
+class FastViewerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.logcat = jclass("android.util.Log")
+        self.looper = jclass("android.os.Looper")
+        self.conn = jclass("org.telegram.tgnet.ConnectionsManager")
+        self.messages = jclass("org.telegram.messenger.MessagesController")
+        self.chat = jclass("org.telegram.messenger.ChatObject")
+        self.dialog = jclass("org.telegram.messenger.DialogObject")
+        self.users = jclass("org.telegram.messenger.UserConfig")
+        self.search = jclass("org.telegram.tgnet.TLRPC$TL_messages_search")
+        self.response_type = jclass("org.telegram.tgnet.TLRPC$messages_Messages").getClass()
+        self.media_filters = [jclass("org.telegram.tgnet.TLRPC$TL_inputMessagesFilter" + name)
+                              for name in FILTERS]
+        self.bridge = jclass("de.robv.android.xposed.XposedBridge")
+        self.box_int = jclass("java.lang.Integer")
+        self.box_long = jclass("java.lang.Long")
+        self.box_bool = jclass("java.lang.Boolean")
+        self.object_array = jarray(jclass("java.lang.Object"))
+
+        viewer = jclass("org.telegram.ui.PhotoViewer").getClass()
+        media = jclass("org.telegram.messenger.MediaDataController").getClass()
+        self.count_event = jclass("org.telegram.messenger.NotificationCenter").mediaCountDidLoad
+        self.fields = {}
+        for name in (
+            "classGuid", "currentAccount", "currentDialogId", "topicId", "mergeDialogId",
+            "currentFiltered", "opennedFromMedia", "needSearchImageInArr",
+            "currentMessageObject", "imagesArr", "countView",
+        ):
+            field = viewer.getDeclaredField(name)
+            field.setAccessible(True)
+            self.fields[name] = field
+
+        self.load_media = declared_method(media, "loadMedia", 12)
+        self.deliver = declared_method(media, "processLoadedMedia", 13)
+        notification = declared_method(viewer, "didReceivedNotification", 3)
+        draw = declared_method(self.fields["countView"].getType(), "onDraw", 1)
+        self.viewer_stack = []
+        self.hidden_counter = None
+        self.pending = {}
+        self.enabled = True
+        hooks = []
+        try:
+            for method, before, after in (
+                (self.load_media, self.before_load, None),
+                (draw, self.before_draw, None),
+                (notification, self.before_notification, self.after_notification),
+            ):
+                handle = self.hook_method(method, before=before, after=after)
+                if handle is None:
+                    raise RuntimeError(f"Hook rejected for {method.getName()}")
+                hooks.append(handle)
+        except Exception:
+            self.enabled = False
+            for handle in hooks:
+                self.unhook_method(handle)
+            raise
+        self.logcat.i(TAG, "NagramXF native media hooks ready")
+
+    def on_plugin_unload(self):
+        self.enabled = False
+
+        def finish():
+            hidden = self.hidden_counter
+            if hidden is not None:
+                self.restore_counter(hidden)
+            for load in tuple(self.pending.values()):
+                load.timeout()
+
+        run_on_ui_thread(finish)
+
+    def before_notification(self, param):
+        if self.looper.myLooper() == self.looper.getMainLooper() and param.args[0] == self.count_event:
+            self.viewer_stack.append(param.thisObject)
+
+    def after_notification(self, param):
+        if (self.looper.myLooper() == self.looper.getMainLooper()
+                and param.args[0] == self.count_event and self.viewer_stack):
+            self.viewer_stack.pop()
+
+    def active(self, load):
+        return (load.viewer.isVisible()
+                and self.fields["classGuid"].getInt(load.viewer) == load.guid
+                and self.fields["currentAccount"].getInt(load.viewer) == load.account)
+
+    def restore_counter(self, load):
+        if self.hidden_counter is load:
+            self.hidden_counter = None
+            load.counter.invalidate()
+
+    def before_draw(self, param):
+        load = self.hidden_counter
+        if load is not None:
+            if not self.enabled or not self.active(load):
+                self.hidden_counter = None
+            elif load.counter == param.thisObject:
+                param.setResult(None)
+
+    def before_load(self, param):
+        if not self.enabled or not self.viewer_stack or self.looper.myLooper() != self.looper.getMainLooper():
+            return
+        args = param.args
+        dialog, count, max_id, min_id, media_type, topic, source, guid = (args[i] for i in range(8))
+        if (not dialog or not guid or count != 20 or max_id or min_id or source != 1
+                or media_type < 0 or media_type >= len(self.media_filters)
+                or args[9] is not None or args[10] or args[11] or guid in self.pending
+                or self.dialog.isEncryptedDialog(dialog)):
+            return
+
+        view = self.viewer_stack[-1]
+        fields = self.fields
+        if (fields["classGuid"].getInt(view) != guid
+                or fields["currentDialogId"].getLong(view) != dialog
+                or fields["topicId"].getLong(view) != topic
+                or fields["mergeDialogId"].getLong(view)
+                or fields["currentFiltered"].getBoolean(view)
+                or fields["opennedFromMedia"].getBoolean(view)
+                or not fields["needSearchImageInArr"].getBoolean(view)):
+            return
+        message = fields["currentMessageObject"].get(view)
+        images = fields["imagesArr"].get(view)
+        if (message is None or images.size() != 1 or images.get(0) != message
+                or message.getDialogId() != dialog or message.isHiddenSensitive()
+                or message.getId() <= 0):
+            return
+
+        try:
+            load = WindowLoad(self, view, message.getId(), param.thisObject, args)
+            if load.start():
+                param.setResult(None)
+        except Exception as error:
+            self.logcat.w(TAG, f"Could not start media window ({type(error).__name__})")
+
+
+class WindowLoad:
+    def __init__(self, plugin, viewer, anchor, controller, args):
+        self.plugin = plugin
+        self.viewer = viewer
+        self.controller = controller
+        self.args = args
+        self.dialog, self.media_type, self.topic, self.guid = args[0], args[4], args[5], args[7]
+        self.account = plugin.fields["currentAccount"].getInt(viewer)
+        self.counter = plugin.fields["countView"].get(viewer)
+        self.anchor = anchor
+        self.messages = plugin.messages.getInstance(self.account)
+        self.connection = plugin.conn.getInstance(self.account)
+        self.token = 0
+
+    def start(self):
+        p = self.plugin
+        self.token = self.send(self.anchor, WINDOW, -(WINDOW // 2 + 1), self.on_window)
+        if not self.token:
+            return False
+        p.pending[self.guid] = self
+        if self.counter is not None:
+            p.hidden_counter = self
+            self.counter.invalidate()
+        run_on_ui_thread(self.timeout, TIMEOUT_MS)
+        p.logcat.i(TAG, "Requested media window")
+        return True
+
+    def send(self, offset, limit, add_offset, callback):
+        p = self.plugin
+        request = p.search()
+        request.peer = self.messages.getInputPeer(self.dialog)
+        if request.peer is None:
+            return 0
+        request.filter = p.media_filters[self.media_type]()
+        request.q = ""
+        request.offset_id = offset
+        request.limit = limit
+        request.add_offset = add_offset
+        if self.topic:
+            if self.dialog == p.users.getInstance(self.account).getClientUserId():
+                request.saved_peer_id = self.messages.getInputPeer(self.topic)
+                if request.saved_peer_id is None:
+                    return 0
+                request.flags |= 4
+            else:
+                if not (0 < self.topic <= 2147483647):
+                    return 0
+                request.top_msg_id = self.topic
+                request.flags |= 2
+        delegate = RequestCallback(
+            lambda result, error: run_on_ui_thread(lambda: callback(result, error)),
+            self.account,
+        )
+        token = self.connection.sendRequest(request, delegate)
+        if token:
+            try:
+                self.connection.bindRequestToGuid(token, self.guid)
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not bind media request ({type(error).__name__})")
+        return token
+
+    def take_pending(self):
+        if self.plugin.pending.get(self.guid) is not self:
+            return False
+        del self.plugin.pending[self.guid]
+        return True
+
+    def results(self, response, error):
+        p = self.plugin
+        if error is not None or not p.response_type.isInstance(response):
+            return ()
+        # Use the same deletion filter as NagramXF's native media search.
+        self.messages.removeDeletedMessagesFromArray(self.dialog, response.messages)
+        messages = response.messages
+        return tuple(messages.get(i).id for i in range(messages.size()))
+
+    def on_window(self, response, error):
+        if not self.take_pending():
+            return
+        p = self.plugin
+        if not p.enabled or not p.active(self):
+            self.fallback()
+            return
+        try:
+            ids = self.results(response, error)
+            if self.anchor not in ids or ids[0] <= 0:
+                self.fallback()
+                return
+            top = ids[0]
+            channel = self.dialog < 0 and p.chat.isChannel(-self.dialog, self.account)
+            # Bounded max_id keeps the client's media cache and deleted-media window accurate.
+            values = p.object_array([
+                response, p.box_long(self.dialog), p.box_int(WINDOW), p.box_int(top),
+                p.box_int(0), p.box_int(self.media_type), p.box_long(self.topic), p.box_int(0),
+                p.box_int(self.guid), p.box_bool(channel), p.box_bool(False),
+                p.box_int(self.args[8]), p.box_bool(self.args[11]),
+            ])
+            p.bridge.invokeOriginalMethod(p.deliver, self.controller, values)
+        except Exception as failure:
+            p.logcat.w(TAG, f"Could not deliver media window: {failure}")
+            self.fallback()
+            return
+        p.logcat.i(TAG, f"Delivered {len(ids)} media items")
+        run_on_ui_thread(lambda: self.probe(top), 300)
+
+    def probe(self, top):
+        p = self.plugin
+
+        def on_newest(response, error):
+            if not p.enabled or p.hidden_counter is not self or not p.active(self):
+                return
+            ids = self.results(response, error)
+            if ids and ids[0] == top:
+                p.restore_counter(self)
+
+        if p.enabled and p.hidden_counter is self and p.active(self):
+            try:
+                self.send(0, 1, 0, on_newest)
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not verify media count ({type(error).__name__})")
+
+    def timeout(self):
+        if self.take_pending():
+            try:
+                self.connection.cancelRequest(self.token, True)
+            finally:
+                self.fallback()
+
+    def fallback(self):
+        p = self.plugin
+        p.restore_counter(self)
+        if p.active(self):
+            try:
+                p.bridge.invokeOriginalMethod(p.load_media, self.controller, self.args)
+                p.logcat.i(TAG, "Fell back to NagramXF media loading")
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not restore media loading ({type(error).__name__})")
