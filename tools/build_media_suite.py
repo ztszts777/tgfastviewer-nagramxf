@@ -22,7 +22,7 @@ __id__ = "nagramxf_media_suite"
 __name__ = "NagramXF 插件合集"
 __description__ = "快速媒体浏览、AyuGram 过滤显示修复、视频和音乐播放工具，功能可分别开关。"
 __author__ = "ztszts777 / TGFastViewer by dunxuan"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __app_version__ = ">=12.10.1"
 
 

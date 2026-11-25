@@ -11,7 +11,7 @@ __id__ = "ayufilter_display_fix"
 __name__ = "AyuGram 消息过滤显示修复"
 __description__ = "修复过滤后的日期、聊天预览、置顶消息和共享媒体列表，沿用聊天自己的过滤规则。"
 __author__ = "Codex"
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 __app_version__ = ">=12.10.1"
 
 PAGE_SIZE = 32
@@ -87,6 +87,8 @@ class AyuFilterDisplayFix(BasePlugin):
         self.date_adapter = None
         self.date_visibility = {}
         self.date_refresh_pending = False
+        self.page_down_context = None
+        self.latest_read_request = None
         self.cells = {}
         self.attached = {}
         self.layouts = []
@@ -118,7 +120,8 @@ class AyuFilterDisplayFix(BasePlugin):
         events = jclass("org.telegram.messenger.NotificationCenter")
         self.filters_changed = events.regexFiltersUpdated
         self.messages_deleted = events.messagesDeleted
-        self.date_events = {events.messagesDidLoad, events.didReceiveNewMessages,
+        self.messages_loaded = events.messagesDidLoad
+        self.date_events = {self.messages_loaded, events.didReceiveNewMessages,
                             events.messagesDeleted, events.replaceMessagesObjects}
         self.pinned_events = {events.pinnedInfoDidLoad, events.didLoadPinnedMessages}
         self.adapter = field(chat, "chatAdapter")
@@ -126,6 +129,12 @@ class AyuFilterDisplayFix(BasePlugin):
         self.pinned_ids = field(chat, "pinnedMessageIds")
         self.pinned_objects = field(chat, "pinnedMessageObjects")
         self.message_dict = field(chat, "messagesDict")
+        self.forward_end = field(chat, "forwardEndReached")
+        self.chat_paused = field(chat, "paused")
+        self.chat_first_loading = field(chat, "firstLoading")
+        self.latest_query = field(chat, "postponedScrollToLastMessageQueryIndex")
+        self.latest_query_canceled = field(chat, "postponedScrollIsCanceled")
+        self.postponed_message = field(chat, "postponedScrollMessageId")
         self.current_pin = field(chat, "currentPinnedMessageId")
         self.pin_index = field(chat, "currentPinnedMessageIndex")
         self.loaded_pin_count = field(chat, "loadedPinnedMessagesCount")
@@ -146,6 +155,11 @@ class AyuFilterDisplayFix(BasePlugin):
         self.hooks.append(self.hook_method(self.view_type, after=self.after_view_type))
         self.hooks.append(self.hook_method(method(chat, "didReceivedNotification", 3),
                                            after=self.after_chat_event))
+        self.hooks.append(self.hook_method(method(chat, "onPageDownClicked", 0),
+                                           before=self.before_page_down,
+                                           after=self.after_page_down))
+        self.hooks.append(self.hook_method(method(chat, "scrollToLastMessage", 3),
+                                           after=self.after_scroll_to_latest))
         self.hooks.append(self.hook_method(self.find_pin, after=self.after_choose_pin))
         for name, arity, role in (("updatePinnedMessageView", 2, "banner"),
                                   ("updatePinnedListButton", 1, "button"),
@@ -765,6 +779,8 @@ class AyuFilterDisplayFix(BasePlugin):
 
     def after_chat_event(self, param):
         event = int(param.args[0])
+        if event == self.messages_loaded and self.latest_read_request is not None:
+            self.after_latest_load(param.thisObject, param.args[2])
         if event in self.pinned_events:
             chat, payload = param.thisObject, param.args[2]
             if len(payload) and int(payload[0]) == chat.getDialogId():
@@ -775,6 +791,74 @@ class AyuFilterDisplayFix(BasePlugin):
             return
         self.date_refresh_pending = True
         run_on_ui_thread(self.refresh_dates, 1)
+
+    def before_page_down(self, param):
+        chat = param.thisObject
+        view = chat.getChatListView()
+        if (self.active and chat.getChatMode() == 0 and not chat.isFeedSearch()
+                and view is not None and not view.isFastScrollAnimationRunning()):
+            self.latest_read_request = None
+            self.page_down_context = chat, self.latest_query.getInt(chat)
+
+    def after_page_down(self, param):
+        self.page_down_context = None
+
+    def after_scroll_to_latest(self, param):
+        chat = param.thisObject
+        context = self.page_down_context
+        if context is None or context[0] != chat:
+            return
+        query = self.latest_query.getInt(chat)
+        if query > 0 and query != context[1]:
+            self.latest_read_request = self.weak(chat), query
+        elif query == 0:
+            self.read_hidden_latest(chat)
+
+    def after_latest_load(self, chat, payload):
+        ref, query = self.latest_read_request
+        if (ref.get() != chat or len(payload) < 15 or int(payload[0]) != chat.getDialogId()
+                or int(payload[10]) != chat.getClassGuid() or abs(int(payload[11])) != query):
+            return
+        next_query = self.latest_query.getInt(chat)
+        if next_query == query:
+            return
+        self.latest_read_request = None
+        if self.latest_query_canceled.getBoolean(chat) or self.postponed_message.getInt(chat):
+            return
+        if next_query > 0:
+            # An incomplete cache page can be replaced by the host's network request.
+            self.latest_read_request = ref, next_query
+        else:
+            self.read_hidden_latest(chat)
+
+    def read_hidden_latest(self, chat):
+        if (not self.active or chat.getChatMode() != 0 or chat.isFeedSearch() or chat.isSecretChat()
+                or chat.isTopic or chat.isThreadChat() or chat.isInPreviewMode()
+                or self.chat_paused.getBoolean(chat) or self.chat_first_loading.getBoolean(chat)
+                or not self.hide_mode.getBoolean(chat) or not self.forward_end.get(chat)[0]):
+            return
+        dialog_id = int(chat.getDialogId())
+        if self.ayu.isDialogExcluded(dialog_id):
+            return
+        controller = self.mc.getInstance(chat.getCurrentAccount())
+        if controller.ignoreSetOnline:
+            return
+        dialog = controller.dialogs_dict.get(dialog_id)
+        if dialog is None or dialog.unread_count <= 0 or dialog.top_message <= 0:
+            return
+        latest = int(dialog.top_message)
+        message = self.message_dict.get(chat)[0].get(latest)
+        adapter = self.adapter.get(chat)
+        if message is None or message.messageOwner is None or adapter is None or adapter.isFiltered or adapter.isFrozen:
+            return
+        index = adapter.getMessages().indexOf(message)
+        start = self.start.getInt(adapter)
+        if index < 0 or start + index >= self.end.getInt(adapter):
+            return
+        if self.position_type(adapter, start + index) == HIDDEN_ROW:
+            # Use the server-backed top ID and the native storage, badge, and read-receipt flow.
+            controller.markDialogAsRead(dialog_id, latest, latest, message.messageOwner.date,
+                                        False, 0, dialog.unread_count, True, 0)
 
     def refresh_dates(self):
         self.date_refresh_pending = False
@@ -954,6 +1038,8 @@ class AyuFilterDisplayFix(BasePlugin):
 
     def on_plugin_unload(self):
         self.active = False
+        self.page_down_context = None
+        self.latest_read_request = None
         for hook in self.hooks:
             self.unhook_method(hook)
 
