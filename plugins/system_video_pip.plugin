@@ -1,0 +1,1481 @@
+from threading import local
+from uuid import uuid4
+
+from android_utils import OnClickListener, run_on_ui_thread
+from base_plugin import BasePlugin
+from java import dynamic_proxy, jarray, jclass, jint
+
+
+__id__ = "system_video_pip"
+__name__ = "系统视频小窗和播控"
+__description__ = "让普通视频使用 Android 画中画，并同步标题、封面和播放状态到系统播控。"
+__author__ = "Codex"
+__version__ = "1.0.9"
+__app_version__ = ">=12.10.1"
+
+LEGACY_NOTIFICATION_ID = 65027
+PENDING_REQUEST = 65120
+FLAG_SECURE = 0x2000
+STATE_ENDED = 4
+PIP_ITEM = 6
+PLAY_PAUSE = 1
+BACK = 2
+FORWARD = 3
+STOP_AUDIO = 4
+BACKGROUND_AUDIO_ITEM = 65348
+BACKGROUND_AUDIO_BLUE = 0xFF62AFF5 - (1 << 32)
+MUSIC_NOTIFICATION_ID = 5
+SKIP_MS = 15000
+COVER_SIZE = 256
+COVER_RETRIES = (1, 90, 220, 450, 900)
+
+
+def field(owner, name):
+    result = owner.getDeclaredField(name)
+    result.setAccessible(True)
+    return result
+
+
+def method(owner, name, arity):
+    result, = (m for m in owner.getDeclaredMethods()
+               if m.getName() == name and len(m.getParameterTypes()) == arity)
+    result.setAccessible(True)
+    return result
+
+
+def video_dimensions(size, fallback_width, fallback_height):
+    if size is not None and size.width > 0 and size.height > 0:
+        if size.unappliedRotationDegrees in (90, 270):
+            return size.height, size.width
+        return size.width, size.height
+    return fallback_width, fallback_height
+
+
+def is_playing(player):
+    return player.getPlayWhenReady() and player.getPlaybackState() != STATE_ENDED
+
+
+def skip_position(position, duration, action):
+    return max(0, min(duration, position + (SKIP_MS if action == FORWARD else -SKIP_MS)))
+
+
+def media_title(caption, filename):
+    for value in (caption, filename):
+        if value is not None:
+            for line in str(value).splitlines():
+                title = " ".join(line.split())
+                if title:
+                    return title[:96]
+    return "视频播放"
+
+
+def cover_size(width, height):
+    factor = min(1.0, COVER_SIZE / max(1, width, height))
+    return max(1, round(width * factor)), max(1, round(height * factor))
+
+
+def message_key(message):
+    return int(message.currentAccount), int(message.getDialogId()), int(message.getId())
+
+
+def loaded_video_cover(plugin, viewer):
+    receiver = viewer.centerImage
+    current = viewer.getCurrentMessageObject()
+    owner = receiver.getParentObject()
+    same_message = (current is None or (owner is not None and plugin.message_type.isInstance(owner)
+                                       and message_key(owner) == message_key(current)))
+    if not same_message:
+        return None
+    holder = receiver.getThumbBitmapSafe() or receiver.getBitmapSafe()
+    if holder is None:
+        return None
+    try:
+        bitmap = holder.bitmap
+        if bitmap is None or bitmap.isRecycled():
+            return None
+        width, height = cover_size(bitmap.getWidth(), bitmap.getHeight())
+        scaled = plugin.bitmap.createScaledBitmap(bitmap, width, height, True)
+        try:
+            return scaled.copy(plugin.bitmap_config, False)
+        finally:
+            if scaled != bitmap:
+                scaled.recycle()
+    finally:
+        holder.release()
+
+
+def video_metadata(plugin, title, subtitle, duration, cover):
+    metadata = plugin.metadata_builder()
+    metadata.putString("android.media.metadata.TITLE", title)
+    metadata.putString("android.media.metadata.DISPLAY_TITLE", title)
+    metadata.putString("android.media.metadata.DISPLAY_SUBTITLE", subtitle)
+    if duration > 0:
+        metadata.putLong("android.media.metadata.DURATION", duration)
+    if cover is not None:
+        for name in ("ART", "ALBUM_ART", "DISPLAY_ICON"):
+            metadata.putBitmap("android.media.metadata." + name, cover)
+    return metadata.build()
+
+
+def media_notification(plugin, context, session, title, subtitle, cover, open_player, ongoing):
+    style = plugin.media_style()
+    style.setMediaSession(session.getSessionToken().getToken())
+    style.setShowActionsInCompactView(0, 1, 2)
+    notification = (plugin.notification_builder(context, plugin.music_channel())
+                    .setSmallIcon(plugin.notification_icon)
+                    .setContentTitle(title)
+                    .setContentText(subtitle)
+                    .setContentIntent(open_player)
+                    .setCategory("transport")
+                    .setShowWhen(False)
+                    .setOnlyAlertOnce(True)
+                    .setVisibility(0)
+                    .setOngoing(ongoing)
+                    .setStyle(style))
+    if cover is not None:
+        notification.setLargeIcon(cover)
+    return notification
+
+
+def video_playback_state(plugin, service, engine, playing, position, actions):
+    session = plugin.music_session.get(service)
+    builder = plugin.state_builder()
+    builder.setActions(1 | 2 | 4 | 256 | 512)
+    speed = engine.getPlaybackParameters().speed if playing and engine is not None else 0.0
+    builder.setState(3 if playing else 2, max(0, position), float(speed))
+    for name, label, icon in actions:
+        builder.addCustomAction(plugin.action_builder(name, label, icon).build())
+    plugin.music_playback_state.set(service, builder)
+    session.setPlaybackState(builder.build())
+    return session
+
+
+class SystemVideoPip(BasePlugin):
+    def on_plugin_load(self):
+        self.sdk = int(jclass("android.os.Build$VERSION").SDK_INT)
+        self.hooks = []
+        self.owned_sources = []
+        self.card = None
+        self.visual_owner = None
+        self.music_service_instance = None
+        self.service_start_requested = False
+        self.suppressed_pip = None
+        self.transfers = []
+        self.active = False
+        self.background = None
+        self.background_choice = None
+        self.background_before_pause = None
+        self.detached_background_viewer = None
+        self.background_items = []
+        self.in_app_playback = local()
+        if self.sdk < 26:
+            return
+        application = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
+        self.application = application
+        self.has_pip = application.getPackageManager().hasSystemFeature("android.software.picture_in_picture")
+
+        self.active = True
+        self.android = jclass("org.telegram.messenger.AndroidUtilities")
+        self.viewer_type = jclass("org.telegram.ui.PhotoViewer").getClass()
+        self.launch = jclass("org.telegram.ui.LaunchActivity").getClass()
+        controller = jclass("org.telegram.messenger.pip.PipActivityController").getClass()
+        source_type = jclass("org.telegram.messenger.pip.PipSource").getClass()
+        handler = jclass("org.telegram.messenger.pip.PipActivityHandler").getClass()
+        self.dialog_object = jclass("org.telegram.messenger.DialogObject")
+        self.messages = jclass("org.telegram.messenger.MessagesController")
+        self.source_builder = jclass("org.telegram.messenger.pip.PipSource$Builder")
+        self.pip_action = jclass("org.telegram.messenger.pip.utils.PipActions")
+        self.pip_utils = jclass("org.telegram.messenger.pip.utils.PipUtils")
+        self.pip_params = jclass("android.app.PictureInPictureParams$Builder")
+        self.remote_actions = field(source_type, "remoteActions")
+        self.array_list = jclass("java.util.ArrayList")
+        self.pip_action_stack = []
+        self.action_interface = jclass("org.telegram.messenger.pip.activity.IPipActivityActionListener")
+        self.source = field(self.viewer_type, "pipSource")
+        self.aspect = field(self.viewer_type, "aspectRatioFrameLayout")
+        self.placeholder = field(self.viewer_type, "pipPlaceholderView")
+        self.layout_params = field(self.viewer_type, "windowLayoutParams")
+        self.menu = field(self.viewer_type, "menuItem")
+        self.video_settings = field(self.viewer_type, "videoItem")
+        self.viewer_player = field(self.viewer_type, "videoPlayer")
+        self.viewer_window_hidden = field(self.viewer_type, "windowViewSkipRender")
+        self.viewer_frame_rendered = field(self.viewer_type, "firstFrameRendered")
+        self.viewer_texture_uploaded = field(self.viewer_type, "textureUploaded")
+        self.inline = field(self.viewer_type, "isInline")
+        self.edit_mode = field(self.viewer_type, "currentEditMode")
+        self.embedded = field(self.viewer_type, "isEmbedVideo")
+        self.maximum = field(controller, "maxPrioritySource")
+        self.session = field(controller, "mediaSession")
+        self.connector = field(controller, "mediaSessionConnector")
+        connector_path = "com.google.android.exoplayer2.ext.mediasession.MediaSessionConnector"
+        connector_type = jclass(connector_path)
+        self.metadata_provider = jclass(connector_path + "$MediaMetadataProvider")
+        self.custom_action = jclass(connector_path + "$CustomActionProvider")
+        self.custom_actions = jarray(self.custom_action)
+        self.connector_provider = field(connector_type.getClass(), "mediaMetadataProvider")
+        self.connector_actions = field(connector_type.getClass(), "customActionProviders")
+        self.action_builder = jclass("android.support.v4.media.session.PlaybackStateCompat$CustomAction$Builder")
+        self.handler_internal = field(handler, "isInPictureInPictureModeInternal")
+        self.handler_activity = field(handler, "activity")
+        self.start_enter = method(handler, "dispatchStartEnterPip", 0)
+        self.object_args = jarray(jclass("java.lang.Object"))
+        self.no_args = self.object_args([])
+        self.java_boolean = jclass("java.lang.Boolean")
+        self.java_integer = jclass("java.lang.Integer")
+        self.weak = jclass("java.lang.ref.WeakReference")
+        drawables = jclass("android.R$drawable")
+        resources = application.getResources()
+        package_name = application.getPackageName()
+
+        def media_icon(name, fallback):
+            return resources.getIdentifier("cast_ic_notification_" + name, "drawable", package_name) or fallback
+
+        # These four monochrome Cast drawables use the same 24 dp icon set.
+        self.seek_actions = (
+            (BACK, "后退 15 秒", media_icon("rewind", drawables.ic_media_rew)),
+            (FORWARD, "前进 15 秒", media_icon("forward", drawables.ic_media_ff)),
+        )
+        self.play_icon = media_icon("play", drawables.ic_media_play)
+        self.pause_icon = media_icon("pause", drawables.ic_media_pause)
+        self.notification_icon = drawables.ic_media_play
+        self.headphone_icon = jclass("org.telegram.messenger.R$drawable").msg_voice_headphones
+        self.stop_icon = media_icon("stop_live_stream", self.headphone_icon)
+        self.icon = jclass("android.graphics.drawable.Icon")
+        self.intent = jclass("android.content.Intent")
+        self.pending_intent = jclass("android.app.PendingIntent")
+        self.notification_builder = jclass("android.app.Notification$Builder")
+        self.media_style = jclass("android.app.Notification$MediaStyle")
+        self.metadata_builder = jclass("android.support.v4.media.MediaMetadataCompat$Builder")
+        self.message_type = jclass("org.telegram.messenger.MessageObject").getClass()
+        self.bitmap = jclass("android.graphics.Bitmap")
+        self.bitmap_config = jclass("android.graphics.Bitmap$Config").ARGB_8888
+        self.pixel_copy = jclass("android.view.PixelCopy")
+        self.pixel_listener = jclass("android.view.PixelCopy$OnPixelCopyFinishedListener")
+        self.ui_handler = jclass("android.os.Handler")(jclass("android.os.Looper").getMainLooper())
+        self.manager = application.getSystemService("notification")
+        self.manager.cancel(LEGACY_NOTIFICATION_ID)
+        self.notifications = jclass("org.telegram.messenger.NotificationsController")
+        self.toast = jclass("android.widget.Toast")
+        self.bind_background_audio()
+        self.bind(self.viewer_type, "preparePlayer", 7, after=self.after_player_ready)
+        self.bind(self.viewer_type, "updatePlayerState", 2, after=self.after_player_ready)
+        video_type = jclass("org.telegram.ui.Components.VideoPlayer").getClass()
+        self.bind(video_type, "onRenderedFirstFrame", 0, after=self.after_cover_frame)
+        self.bind(self.viewer_type, "switchToPip", 1, before=self.before_switch_to_pip)
+        self.bind(self.viewer_type, "onUserLeaveHint", 0, before=self.before_leave)
+        self.bind(self.viewer_type, "onPause", 0, before=self.before_viewer_pause)
+        self.bind(self.viewer_type, "onResume", 0, after=lambda param: self.clear_pause_state(param.thisObject))
+        self.bind(self.viewer_type, "onPhotoClosed", 1, before=self.before_viewer_closed)
+        self.bind(self.viewer_type, "releasePlayer", 1, before=self.before_viewer_release)
+        self.bind(self.viewer_type, "setImageIndex", 4, after=self.after_background_index)
+        self.bind(self.viewer_type, "pipIsAvailable", 0, after=self.retain_paused_card)
+        self.hooks.append(self.hook_method(self.start_enter, before=self.before_start_enter))
+        for name in ("pipHidePrimaryWindowView", "pipShowPrimaryWindowView"):
+            self.bind(self.viewer_type, name, 1, before=self.before_transfer,
+                      after=self.after_transfer)
+        self.bind(controller, "onMaxPrioritySourceChanged", 2, after=self.after_priority)
+        self.bind(source_type, "buildPictureInPictureParams", 0,
+                  before=self.before_pip_params, after=self.after_pip_params)
+        self.bind(handler, "manualEnterPictureInPictureModeInternal", 0, before=self.before_native_enter)
+        self.bind(handler, "onStop", 0, before=self.before_activity_stop)
+        if self.sdk >= 31 and self.has_pip:
+            pip_state = jclass("org.telegram.messenger.pip.source.PipSourceHandlerState2").getClass()
+            self.stash_source = field(pip_state, "source")
+            for name in ("onPipStashStart", "onPipStashEnd"):
+                self.bind(pip_state, name, 0, before=self.before_stash_playback)
+
+        run_on_ui_thread(self.refresh_features)
+
+    def bind(self, owner, name, arity, **callbacks):
+        self.hooks.append(self.hook_method(method(owner, name, arity), **callbacks))
+
+    def option(self, key):
+        return getattr(self, "flags", {}).get(key, True)
+
+    def transport_buttons(self, playing):
+        back, forward = self.seek_actions
+        label, icon = ("暂停", self.pause_icon) if playing else ("播放", self.play_icon)
+        return back, (PLAY_PAUSE, label, icon), forward
+
+    def music_channel(self):
+        self.notifications.checkOtherNotificationsChannel()
+        return self.notifications.OTHER_NOTIFICATIONS_CHANNEL
+
+    def publish_music_notification(self, service, notification):
+        if self.sdk < 31 or not self.music_foreground.getBoolean(service):
+            service.startForeground(MUSIC_NOTIFICATION_ID, notification)
+            self.music_foreground.setBoolean(service, True)
+        else:
+            self.manager.notify(MUSIC_NOTIFICATION_ID, notification)
+
+    def refresh_features(self, refresh_card=False):
+        if not self.active:
+            return
+        if not self.option("background_audio"):
+            if self.background_choice is not None:
+                viewer = self.background_choice[0].get()
+                self.background_choice = self.background_before_pause = None
+                if viewer is not None:
+                    self.refresh_auto_pip(viewer)
+            if self.background is not None:
+                self.stop_background()
+        if refresh_card:
+            self.drop_card()
+        for name in ("Instance", "Instance2"):
+            viewer = field(self.viewer_type, name).get(None)
+            if viewer is not None:
+                if viewer.isVisible():
+                    self.sync_viewer(viewer)
+                else:
+                    self.update_background_item(viewer)
+                source = self.source.get(viewer)
+                if refresh_card and source is not None:
+                    source.invalidateAvailability()
+                    if self.maximum.get(source.controller) == source:
+                        self.pip_utils.applyPictureInPictureParams(source.controller.activity, source)
+
+    def ordinary_video(self, viewer, *, allow_finishing=False):
+        if self.embedded.getBoolean(viewer) or self.inline.getBoolean(viewer) or self.edit_mode.getInt(viewer):
+            return False
+        activity = viewer.getParentActivity()
+        if activity is None or not self.launch.isInstance(activity) or (activity.isFinishing() and not allow_finishing):
+            return False
+        player = viewer.getVideoPlayer()
+        params = self.layout_params.get(viewer)
+        if player is None or player.player is None or params is None or params.flags & FLAG_SECURE:
+            return False
+        message = viewer.getCurrentMessageObject()
+        if message is not None:
+            raw = message.messageOwner
+            dialog = message.getDialogId()
+            if (raw is not None and (raw.noforwards or 0 < raw.ttl < 3600)
+                    or message.hasRevealedExtendedMedia()
+                    or self.dialog_object.isEncryptedDialog(dialog)
+                    or self.messages.getInstance(message.currentAccount).isPeerNoForwards(dialog)):
+                return False
+        return True
+
+    def eligible(self, viewer):
+        if not self.has_pip or not self.ordinary_video(viewer):
+            return False
+        menu = self.menu.get(viewer)
+        return menu is not None and menu.isSubItemVisible(PIP_ITEM)
+
+    def retain_paused_card(self, param):
+        viewer, card = param.thisObject, self.card
+        if (self.active and self.option("media_controls") and not param.getResult()
+                and card is not None and card.source.delegate == viewer and viewer.isVisible()
+                and self.eligible(viewer) and card.source.getPlayer() == viewer.getVideoPlayer().player):
+            param.setResult(True)
+
+    def bind_background_audio(self):
+        self.media = jclass("org.telegram.messenger.MediaController").getInstance()
+        video_player = jclass("org.telegram.ui.Components.VideoPlayer").getClass()
+        self.track_selector = field(video_player, "trackSelector")
+        self.music_service = jclass("org.telegram.messenger.MusicPlayerService").getClass()
+        self.music_session = field(self.music_service, "mediaSession")
+        self.music_foreground = field(self.music_service, "foregroundServiceIsStarted")
+        self.music_playback_state = field(self.music_service, "playbackState")
+        self.music_create_notification = method(self.music_service, "createNotification", 2)
+        self.state_builder = jclass("android.support.v4.media.session.PlaybackStateCompat$Builder")
+        self.uri = jclass("android.net.Uri")
+        self.play_state_event = jclass("org.telegram.messenger.NotificationCenter").messagePlayingPlayStateChanged
+        self.visual_service_action = self.application.getPackageName() + ".video-playback-card"
+        self.bind(self.music_service, "onCreate", 0, after=self.after_music_create)
+        self.bind(self.music_service, "onDestroy", 0, after=self.after_music_destroy)
+        self.bind(self.music_service, "createNotification", 2, before=self.before_music_notification)
+        self.bind(self.music_service, "updatePlaybackState", 1, before=self.before_music_state)
+        self.bind(self.music_service, "onStartCommand", 3, before=self.before_music_command)
+        self.bind(self.music_service, "didReceivedNotification", 3, before=self.before_music_event)
+        callback = jclass("org.telegram.messenger.MusicPlayerService$2").getClass()
+        self.bind(callback, "onCustomAction", 2, before=self.before_music_action)
+        self.bind(callback, "onStop", 0, before=self.before_music_stop)
+        self.bind(callback, "onPlay", 0, before=self.before_visual_play)
+        self.bind(callback, "onPause", 0, before=self.before_visual_pause)
+        self.bind(callback, "onSeekTo", 1, before=self.before_visual_seek)
+        controller = self.media.getClass()
+        self.bind(controller, "cleanupPlayer", 4, before=self.before_background_cleanup)
+        self.bind(controller, "updateVideoState", 5, after=self.after_background_player_state)
+        self.bind(controller, "playMessage", 2, after=self.after_native_music_play)
+        playback_bar = jclass("org.telegram.ui.Components.FragmentContextView").getClass()
+        check_player = method(playback_bar, "checkPlayer", 1)
+        try:
+            jclass("de.robv.android.xposed.XposedBridge").deoptimizeMethod(check_player)
+        except Exception as error:
+            self.log(f"Could not deoptimize the in-app playback bar: {type(error).__name__}")
+        self.hooks.append(self.hook_method(check_player, before=self.before_in_app_player, after=self.after_in_app_player))
+        self.bind(self.message_type, "isVideo", 0, before=self.before_in_app_is_video)
+        self.bind(self.message_type, "getMusicTitle", 0, before=self.before_in_app_title)
+        self.bind(self.message_type, "getMusicAuthor", 0, before=self.before_in_app_author)
+
+    def before_in_app_player(self, param):
+        stack = getattr(self.in_app_playback, "stack", None)
+        if stack is None:
+            stack = self.in_app_playback.stack = []
+        stack.append(self.current_background() if self.active else None)
+
+    def after_in_app_player(self, param):
+        self.in_app_playback.stack.pop()
+
+    def in_app_audio(self, message):
+        # Only the native player bar's synchronous refresh sees background video as audio.
+        stack = getattr(self.in_app_playback, "stack", ())
+        audio = stack[-1] if stack else None
+        return audio if audio is not None and audio.message == message else None
+
+    def before_in_app_is_video(self, param):
+        if self.in_app_audio(param.thisObject) is not None:
+            param.setResult(False)
+
+    def before_in_app_title(self, param):
+        audio = self.in_app_audio(param.thisObject)
+        if audio is not None:
+            param.setResult(audio.title)
+
+    def before_in_app_author(self, param):
+        if self.in_app_audio(param.thisObject) is not None:
+            param.setResult("后台听视频")
+
+    def update_background_item(self, viewer):
+        menu = self.video_settings.get(viewer)
+        if menu is None:
+            return
+        message = viewer.getCurrentMessageObject()
+        show = (self.option("background_audio") and message is not None and message.isVideo()
+                and message.getDocument() is not None and self.ordinary_video(viewer))
+        self.background_items = [entry for entry in self.background_items if entry[1].get() is not None]
+        for menu_ref, row_ref in self.background_items:
+            if menu_ref.get() == menu:
+                row = row_ref.get()
+                row.setVisibility(0 if show else 8)
+                if show:
+                    self.style_background_item(row, self.background_armed(viewer))
+                return
+        if not show:
+            return
+        row = menu.addSubItem(BACKGROUND_AUDIO_ITEM, self.headphone_icon, "后台听视频")
+        self.style_background_item(row, self.background_armed(viewer))
+        row.setSelectorColor(0x0FFFFFFF)
+        viewer_ref = self.weak(viewer)
+
+        def listen(view):
+            menu.closeSubMenu()
+            self.toggle_background(viewer_ref.get())
+
+        row.setOnClickListener(OnClickListener(listen))
+        self.background_items.append((self.weak(menu), self.weak(row)))
+
+    def style_background_item(self, row, enabled):
+        color = BACKGROUND_AUDIO_BLUE if enabled else -1
+        row.setColors(color, color)
+        row.setSelected(enabled)
+
+    def background_armed(self, viewer):
+        choice = self.background_choice
+        if choice is None or not self.option("background_audio") or choice[0].get() != viewer:
+            return False
+        message = viewer.getCurrentMessageObject()
+        return message is not None and message_key(message) == choice[1]
+
+    def toggle_background(self, viewer):
+        if (viewer is None or not self.active or not self.option("background_audio")
+                or not viewer.isVisible() or not self.ordinary_video(viewer)):
+            return
+        if self.background_armed(viewer):
+            self.clear_background_choice(viewer)
+        else:
+            message = viewer.getCurrentMessageObject()
+            if message is None or not message.isVideo() or message.getDocument() is None:
+                return
+            self.background_choice = (self.weak(viewer), message_key(message))
+            self.refresh_auto_pip(viewer)
+        self.update_background_item(viewer)
+
+    def refresh_auto_pip(self, viewer):
+        source = self.source.get(viewer)
+        if source is not None and self.maximum.get(source.controller) == source:
+            self.pip_utils.applyPictureInPictureParams(source.controller.activity, source)
+
+    def clear_pause_state(self, viewer):
+        paused = self.background_before_pause
+        if paused is not None and paused[0].get() == viewer:
+            self.background_before_pause = None
+
+    def clear_background_choice(self, viewer, *, refresh_pip=True):
+        choice = self.background_choice
+        if choice is not None and choice[0].get() == viewer:
+            self.background_choice = None
+            self.clear_pause_state(viewer)
+            if refresh_pip:
+                self.refresh_auto_pip(viewer)
+
+    def after_background_index(self, param):
+        viewer = param.thisObject
+        choice = self.background_choice
+        if choice is not None and choice[0].get() == viewer and not self.background_armed(viewer):
+            self.clear_background_choice(viewer)
+            self.update_background_item(viewer)
+
+    def before_viewer_pause(self, param):
+        viewer = param.thisObject
+        if self.background_armed(viewer):
+            player = viewer.getVideoPlayer()
+            if player is not None and player.player is not None:
+                self.background_before_pause = (self.weak(viewer), player, is_playing(player.player))
+
+    def before_activity_stop(self, param):
+        choice = self.background_choice
+        viewer = choice[0].get() if choice is not None else None
+        if not self.active or viewer is None or not self.background_armed(viewer):
+            return
+        handler = param.thisObject
+        if viewer.getParentActivity() != self.handler_activity.get(handler):
+            return
+        pip_closed = self.handler_internal.getBoolean(handler)
+        paused = self.background_before_pause
+        resume = (paused[2] if not pip_closed and paused is not None
+                  and paused[0].get() == viewer and paused[1] == viewer.getVideoPlayer() else None)
+        self.start_background(viewer, pip_closed=pip_closed, resume=resume)
+
+    def before_viewer_release(self, param):
+        viewer = param.thisObject
+        if self.active and param.args[0] and self.background_armed(viewer):
+            self.start_background(viewer, close_viewer=False)
+
+    def before_viewer_closed(self, param):
+        viewer = param.thisObject
+        if self.active and self.background_armed(viewer):
+            self.start_background(viewer, close_viewer=False)
+        self.clear_background_choice(viewer, refresh_pip=False)
+
+    def start_background(self, viewer, *, pip_closed=False, resume=None, close_viewer=True):
+        if (viewer is None or not self.active or not self.option("background_audio")
+                or not viewer.isVisible()
+                or not self.ordinary_video(viewer, allow_finishing=pip_closed)):
+            return
+        message = viewer.getCurrentMessageObject()
+        if message is None or not message.isVideo() or message.getDocument() is None:
+            return
+        activity = viewer.getParentActivity()
+        player = viewer.getVideoPlayer()
+        engine = player.player
+        resume = is_playing(engine) if resume is None else resume
+        volume = player.getVolume()
+        audio = None
+        transferred = False
+        try:
+            selector = self.track_selector.get(player)
+            original = selector.getParameters()
+            audio_only = original.buildUpon().setTrackTypeDisabled(2, True).build()
+            audio = BackgroundAudio(self, viewer, message, player, original)
+            if self.media.getPlayingMessageObject() is not None and self.media.getVideoPlayer() != player:
+                self.media.cleanupPlayer(True, False)
+            self.drop_card(keep_service=True)
+            self.background = audio
+            self.media.injectVideoPlayer(player, message)
+            self.viewer_player.set(viewer, None)
+            transferred = True
+            if pip_closed:
+                self.detached_background_viewer = self.weak(viewer)
+            player.setTextureView(None)
+            player.setSurfaceView(None)
+            player.setSurface(None)
+            selector.setParameters(audio_only)
+            player.setVolume(volume)
+            if resume:
+                player.play()
+            else:
+                self.media.pauseMessage(message, False)
+            service = self.active_music_service()
+            if service is not None:
+                audio.publish(service)
+            elif self.application.startForegroundService(self.intent(self.application, self.music_service)) is None:
+                raise RuntimeError("MusicPlayerService did not start")
+            getattr(self, "on_background_handoff", lambda viewer: None)(viewer)
+            self.clear_background_choice(viewer, refresh_pip=False)
+            if close_viewer:
+                viewer.closePhoto(False, False)
+            activity.getWindow().clearFlags(0x80)
+        except Exception as error:
+            self.log(f"Background video audio failed: {type(error).__name__}: {error}")
+            if audio is not None and self.background is audio:
+                if transferred:
+                    self.stop_background()
+                    if close_viewer:
+                        viewer.closePhoto(False, False)
+                else:
+                    self.background = None
+            self.toast.makeText(activity, "暂时无法在后台播放这个视频", 0).show()
+
+    def current_background(self):
+        audio = self.background
+        if (audio is not None and self.media.getVideoPlayer() == audio.player
+                and self.media.getPlayingMessageObject() == audio.message):
+            return audio
+        return None
+
+    def current_visual(self):
+        card = self.visual_owner
+        if self.active and card is not None and card is self.card and self.option("media_controls"):
+            return card
+        return None
+
+    def active_music_service(self):
+        return self.music_service_instance.get() if self.music_service_instance is not None else None
+
+    def after_music_create(self, param):
+        self.music_service_instance = self.weak(param.thisObject)
+
+    def after_music_destroy(self, param):
+        if self.active_music_service() == param.thisObject:
+            self.music_service_instance = None
+            self.service_start_requested = False
+            card = self.current_visual()
+            if card is not None:
+                card.service_publication = None
+                card.shared_verified = None
+                card.shared_confirmation = None
+                card.native_publication = None
+                self.publish_native_visual(card)
+
+    def update_visual_card(self, card, playing):
+        if not self.option("media_controls"):
+            return
+        if self.visual_owner is not card:
+            if not playing and self.media.getPlayingMessageObject() is not None:
+                return
+            self.visual_owner = card
+            card.service_publication = None
+            card.shared_verified = card.shared_confirmation = None
+            card.native_publication = None
+        service = self.active_music_service()
+        if service is not None and self.publish_shared_visual(card, service):
+            return
+        self.publish_native_visual(card)
+        try:
+            if service is None and not self.service_start_requested:
+                self.service_start_requested = True
+                intent = self.intent(self.application, self.music_service).setAction(self.visual_service_action)
+                if self.application.startService(intent) is None:
+                    raise RuntimeError("MusicPlayerService did not start")
+        except Exception as error:
+            self.service_start_requested = False
+            self.log(f"Shared video card failed: {type(error).__name__}: {error}")
+
+    def publish_native_visual(self, card):
+        try:
+            self.restore_pip_session()
+            card.publish_native()
+        except Exception as error:
+            self.log(f"Native video card failed: {type(error).__name__}: {error}")
+
+    def publish_shared_visual(self, card, service):
+        try:
+            if not card.publish_service(service):
+                return False
+        except Exception as error:
+            card.shared_verified = card.shared_confirmation = None
+            self.log(f"Shared video card failed: {type(error).__name__}: {error}")
+            return False
+        if card.shared_verified != service and card.shared_confirmation != service:
+            card.shared_confirmation = service
+            run_on_ui_thread(lambda: self.confirm_shared_visual(card, service, 2), 100)
+        return True
+
+    def confirm_shared_visual(self, card, service, retries):
+        if (self.current_visual() is not card or self.active_music_service() != service
+                or card.shared_confirmation != service):
+            return
+        try:
+            session = self.music_session.get(service)
+            token = session.getSessionToken().getToken() if session is not None else None
+            visible = token is not None and any(
+                item.getId() == MUSIC_NOTIFICATION_ID
+                and item.getNotification().extras.getParcelable("android.mediaSession") == token
+                for item in self.manager.getActiveNotifications()
+            )
+        except Exception as error:
+            self.log(f"Could not confirm shared video notification: {type(error).__name__}: {error}")
+            visible = False
+        if visible:
+            card.shared_confirmation = None
+            try:
+                card.clear_native_publication()
+                self.suppress_pip_session(card.source.controller)
+                card.shared_verified = service
+            except Exception as error:
+                self.log(f"Could not retire the native video session: {type(error).__name__}: {error}")
+        elif retries:
+            run_on_ui_thread(lambda: self.confirm_shared_visual(card, service, retries - 1), 180)
+        else:
+            card.shared_confirmation = None
+            card.service_publication = None
+            card.native_publication = None
+            self.publish_native_visual(card)
+
+    def restore_music_card(self):
+        service = self.active_music_service()
+        message = self.media.getPlayingMessageObject()
+        if service is None:
+            if message is None:
+                self.manager.cancel(MUSIC_NOTIFICATION_ID)
+            return
+        if message is None:
+            def stop_if_unused():
+                if (self.visual_owner is None and self.active_music_service() == service
+                        and self.media.getPlayingMessageObject() is None):
+                    service.stopSelf()
+                    self.manager.cancel(MUSIC_NOTIFICATION_ID)
+
+            run_on_ui_thread(stop_if_unused, 100)
+        else:
+            try:
+                self.music_create_notification.invoke(service, self.object_args([message, self.java_boolean(False)]))
+            except Exception as error:
+                self.log(f"Could not refresh the music card: {type(error).__name__}: {error}")
+
+    def after_native_music_play(self, param):
+        card = self.current_visual()
+        message = param.args[0]
+        if (card is None or not param.getResult() or message is None
+                or self.media.getPlayingMessageObject() != message
+                or not (message.isMusic() or message.isVoice() or message.isRoundVideo())):
+            return
+        self.visual_owner = None
+        card.clear_native_publication()
+        self.suppress_pip_session(card.source.controller)
+        player = card.source.getPlayer()
+        if player is not None and is_playing(player):
+            player.pause()
+        self.restore_music_card()
+
+    def stop_background(self):
+        if self.current_background() is not None:
+            self.media.cleanupPlayer(True, True)
+        self.background = None
+
+    def before_background_cleanup(self, param):
+        audio = self.current_background()
+        if audio is not None:
+            self.background = None
+            if param.args[3] and audio.player.player is not None:
+                self.track_selector.get(audio.player).setParameters(audio.track_selection)
+
+    def after_background_player_state(self, param):
+        audio = self.current_background()
+        activity = audio.activity.get() if audio is not None else None
+        if activity is not None:
+            activity.getWindow().clearFlags(0x80)
+        if audio is not None and not param.args[3] and not self.media.isMessagePaused():
+            # Another player can pause VideoPlayer directly through Nagram's playback event.
+            # Wait until native pauseMessage has finished updating MediaController.
+            def sync_pause():
+                if (self.active and self.current_background() is audio
+                        and not audio.player.isPlaying() and not self.media.isMessagePaused()):
+                    self.media.pauseMessage(audio.message, False)
+
+            run_on_ui_thread(sync_pause, 1)
+
+    def before_music_notification(self, param):
+        card = self.current_visual()
+        if card is not None:
+            service = param.thisObject
+            self.music_service_instance = self.weak(service)
+            if not self.publish_shared_visual(card, service):
+                self.publish_native_visual(card)
+            param.setResult(None)
+            return
+        audio = self.current_background()
+        if audio is not None and param.args[0] == audio.message:
+            try:
+                audio.publish(param.thisObject)
+                param.setResult(None)
+            except Exception as error:
+                self.log(f"Background audio notification failed: {type(error).__name__}: {error}")
+
+    def before_music_event(self, param):
+        if (int(param.args[0]) == self.play_state_event and self.current_visual() is not None
+                and self.media.getPlayingMessageObject() is None):
+            # The native audio observer stops the service when its own player becomes empty.
+            param.setResult(None)
+
+    def before_music_state(self, param):
+        if self.current_visual() is not None:
+            param.setResult(None)
+            return
+        audio = self.current_background()
+        if audio is not None:
+            try:
+                audio.publish_state(param.thisObject, int(param.args[0]))
+                param.setResult(None)
+            except Exception as error:
+                self.log(f"Background audio state failed: {type(error).__name__}: {error}")
+
+    def before_music_command(self, param):
+        audio, intent = self.current_background(), param.args[0]
+        service = param.thisObject
+        self.music_service_instance = self.weak(service)
+        self.service_start_requested = False
+        if audio is not None and intent is not None and audio.dispatch(intent.getAction()):
+            param.setResult(self.java_integer(2))  # Service.START_NOT_STICKY
+            return
+        card = self.current_visual()
+        if card is not None:
+            if not self.publish_shared_visual(card, service):
+                self.publish_native_visual(card)
+            param.setResult(self.java_integer(2))
+
+    def before_music_action(self, param):
+        card = self.current_visual()
+        if card is not None and card.dispatch_session_action(param.args[0]):
+            param.setResult(None)
+            return
+        audio = self.current_background()
+        if audio is not None and audio.dispatch(param.args[0]):
+            param.setResult(None)
+
+    def before_music_stop(self, param):
+        if self.current_visual() is not None:
+            self.before_visual_pause(param)
+        elif self.current_background() is not None:
+            self.stop_background()
+            param.setResult(None)
+
+    def before_visual_play(self, param):
+        card = self.current_visual()
+        if card is not None:
+            card.set_playing(True)
+            param.setResult(None)
+
+    def before_visual_pause(self, param):
+        card = self.current_visual()
+        if card is not None:
+            card.set_playing(False)
+            param.setResult(None)
+
+    def before_visual_seek(self, param):
+        card = self.current_visual()
+        if card is not None:
+            card.seek_to(int(param.args[0]))
+            param.setResult(None)
+
+    def ensure_source(self, viewer):
+        activity = viewer.getParentActivity()
+        if not self.android.checkPipPermissions(activity):
+            return None
+        source = self.source.get(viewer)
+        if source is None:
+            aspect = self.aspect.get(viewer)
+            placeholder = self.placeholder.get(viewer)
+            if aspect is None or placeholder is None:
+                return None
+            player = viewer.getVideoPlayer()
+            width, height = video_dimensions(player.player.getVideoSize(),
+                                             aspect.getWidth(), aspect.getHeight())
+            source = (self.source_builder(activity, viewer)
+                      .setTagPrefix("photo-viewer-system-plugin")
+                      .setContentView(aspect)
+                      .setPlaceholderView(placeholder)
+                      .setContentRatio(width, height)
+                      .setPlayer(player.player)
+                      .setNeedMediaSession(True)
+                      .build())
+            self.source.set(viewer, source)
+            self.owned_sources = [(v, s) for v, s in self.owned_sources
+                                  if v.get() is not None and s.get() is not None]
+            self.owned_sources.append((self.weak(viewer), self.weak(source)))
+        return source
+
+    def after_player_ready(self, param):
+        self.sync_viewer(param.thisObject)
+
+    def after_cover_frame(self, param):
+        card = self.card
+        if card is None or card.cover is not None or card.cover_key is None or not self.option("media_controls"):
+            return
+        if card.source.delegate.getVideoPlayer() == param.thisObject:
+            key = card.cover_key
+            run_on_ui_thread(lambda: card.capture_cover(key, None), 1)
+
+    def sync_viewer(self, viewer):
+        if not self.active:
+            return
+        self.update_background_item(viewer)
+        if self.background is not None and viewer.getVideoPlayer() == self.background.player:
+            return
+        if (not (self.option("system_pip") or self.option("media_controls"))
+                or not self.eligible(viewer)):
+            if self.card is not None and self.card.source.delegate == viewer:
+                self.drop_card()
+            return
+        source = self.ensure_source(viewer)
+        if source is not None and self.maximum.get(source.controller) == source:
+            self.sync_card(source)
+
+    def before_switch_to_pip(self, param):
+        viewer = param.thisObject
+        if not self.active or not self.option("system_pip") or not self.eligible(viewer):
+            return
+        param.setResult(None)
+        activity = viewer.getParentActivity()
+        if not self.android.checkPipPermissions(activity):
+            self.toast.makeText(activity, "请在系统设置中允许 NagramXF 使用画中画", 0).show()
+            return
+        if not self.enter(viewer):
+            self.toast.makeText(activity, "系统小窗暂不可用，请在视频开始播放后重试", 0).show()
+
+    def enter(self, viewer):
+        activity = viewer.getParentActivity()
+        if activity.isInPictureInPictureMode():
+            return True
+        source = self.ensure_source(viewer)
+        if source is None:
+            return False
+        source.invalidatePosition()
+        source.invalidateAvailability()
+        if not source.isAvailable() or self.maximum.get(source.controller) != source:
+            return False
+        handler = source.controller.getHandler()
+        if self.handler_internal.getBoolean(handler):
+            return True
+        try:
+            if not activity.enterPictureInPictureMode(source.buildPictureInPictureParams()):
+                return False
+        except Exception as error:
+            self.log(f"System PiP request failed ({type(error).__name__})")
+            return False
+        if not self.handler_internal.getBoolean(handler):
+            self.start_enter.invoke(handler, self.no_args)
+        return True
+
+    def before_start_enter(self, param):
+        handler = param.thisObject
+        if not self.active or not self.handler_internal.getBoolean(handler):
+            return
+        activity = self.handler_activity.get(handler)
+        if self.launch.isInstance(activity):
+            source = self.maximum.get(activity.getPipController())
+            if (source is not None and self.viewer_type.isInstance(source.delegate)
+                    and self.eligible(source.delegate)):
+                param.setResult(None)
+
+    def before_leave(self, param):
+        viewer = param.thisObject
+        if self.active and self.background_armed(viewer):
+            param.setResult(None)
+            activity = viewer.getParentActivity()
+            if activity is not None and not activity.isInPictureInPictureMode():
+                self.start_background(viewer)
+            return
+        if self.active and self.option("system_pip") and self.eligible(viewer):
+            # Normal system entry on Home is driven by the host's PipActivityHandler.
+            param.setResult(None)
+            if self.sdk < 31 and is_playing(viewer.getVideoPlayer().player):
+                self.enter(viewer)
+
+    def before_transfer(self, param):
+        viewer = param.thisObject
+        player = viewer.getVideoPlayer()
+        detached = self.detached_background_viewer
+        if (player is None and detached is not None and detached.get() == viewer):
+            # The PiP transition may finish after the audio handoff has closed PhotoViewer.
+            self.transfers.append(None)
+            self.viewer_window_hidden.setBoolean(viewer, False)
+            callback = param.args[0]
+            if callback is not None:
+                run_on_ui_thread(callback.run, 1)
+            param.setResult(None)
+            return
+        source = self.source.get(viewer)
+        keep_paused = (self.active and source is not None and player is not None
+                       and player.player is not None and not player.player.getPlayWhenReady())
+        self.transfers.append(player if keep_paused else None)
+
+    def before_stash_playback(self, param):
+        if not self.active or not self.option("system_pip"):
+            return
+        source = self.stash_source.get(param.thisObject)
+        if source is not None and self.viewer_type.isInstance(source.delegate):
+            # Docking is a window change. The host would pause on docking and play on undocking.
+            if self.source.get(source.delegate) == source:
+                param.setResult(None)
+
+    def after_transfer(self, param):
+        player = self.transfers.pop()
+        if player is not None and param.thisObject.getVideoPlayer() == player:
+            player.pause()
+
+    def after_priority(self, param):
+        previous, current = param.args[0], param.args[1]
+        if (self.active and (self.option("system_pip") or self.option("media_controls"))
+                and current is not None and self.viewer_type.isInstance(current.delegate)
+                and self.eligible(current.delegate)):
+            self.sync_card(current)
+        elif self.card is not None and self.card.source == previous and previous != current:
+            self.drop_card()
+
+    def sync_card(self, source):
+        player = source.getPlayer()
+        if player is None:
+            return
+        replace = self.card is not None and self.card.source != source
+        restore = replace and self.visual_owner is self.card
+        if replace:
+            self.drop_card(keep_service=True)
+        if self.card is None:
+            self.card = PlaybackCard(self, source)
+        self.card.publish(player)
+        if restore and self.visual_owner is None:
+            self.restore_music_card()
+
+    def suppress_pip_session(self, controller):
+        session = self.session.get(controller)
+        if self.suppressed_pip == (controller, session):
+            return
+        self.restore_pip_session()
+        if session is not None:
+            # PipActivityController activates newly created sessions for its current source.
+            session.setActive(False)
+            self.suppressed_pip = (controller, session)
+
+    def restore_pip_session(self):
+        suppressed, self.suppressed_pip = self.suppressed_pip, None
+        if suppressed is not None:
+            controller, session = suppressed
+            if self.session.get(controller) == session:
+                session.setActive(True)
+
+    def drop_card(self, *, keep_service=False):
+        card, self.card = self.card, None
+        had_visual = self.visual_owner is not None
+        self.visual_owner = None
+        if card is not None:
+            card.close()
+        self.restore_pip_session()
+        if had_visual and not keep_service:
+            self.restore_music_card()
+
+    def before_pip_params(self, param):
+        source = param.thisObject
+        card = self.card
+        change = (self.active and self.option("system_pip") and card is not None
+                  and card.source == source and card.remote is not None)
+        original = self.remote_actions.get(source) if change else None
+        self.pip_action_stack.append((change, original))
+        if change:
+            self.remote_actions.set(source, card.remote)
+
+    def after_pip_params(self, param):
+        changed, original = self.pip_action_stack.pop()
+        if changed:
+            self.remote_actions.set(param.thisObject, original)
+        source = param.thisObject
+        if self.active and self.sdk >= 31 and self.viewer_type.isInstance(source.delegate):
+            player = source.getPlayer()
+            if not self.option("system_pip"):
+                param.setResult(self.pip_params().setAutoEnterEnabled(False).build())
+            elif self.background_armed(source.delegate) or (player is not None and not is_playing(player)):
+                actions = self.card.remote if changed else self.remote_actions.get(source)
+                param.setResult(source.params.build().setActions(actions).setAutoEnterEnabled(False).build())
+
+    def before_native_enter(self, param):
+        if not self.active:
+            return
+        activity = self.handler_activity.get(param.thisObject)
+        if self.launch.isInstance(activity):
+            source = self.maximum.get(activity.getPipController())
+            if (source is not None and self.viewer_type.isInstance(source.delegate)
+                    and (not self.option("system_pip") or self.background_armed(source.delegate))):
+                param.setResult(None)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for hook in self.hooks:
+            self.unhook_method(hook)
+
+        def restore():
+            choice, self.background_choice = self.background_choice, None
+            self.background_before_pause = None
+            viewer = choice[0].get() if choice is not None else None
+            if viewer is not None:
+                self.refresh_auto_pip(viewer)
+            self.stop_background()
+            self.drop_card()
+            for _, row_ref in self.background_items:
+                row = row_ref.get()
+                if row is not None and row.getParent() is not None:
+                    row.getParent().removeView(row)
+            self.background_items.clear()
+            for viewer_ref, source_ref in self.owned_sources:
+                viewer, source = viewer_ref.get(), source_ref.get()
+                if viewer is not None and source is not None and self.source.get(viewer) == source:
+                    if not source.state2.isAttachedToPip():
+                        self.source.set(viewer, None)
+                        source.destroy()
+            self.owned_sources.clear()
+
+        run_on_ui_thread(restore)
+
+
+class BackgroundAudio:
+    def __init__(self, plugin, viewer, message, player, original_tracks):
+        self.plugin = plugin
+        self.message = message
+        self.player = player
+        self.track_selection = original_tracks
+        activity = viewer.getParentActivity()
+        self.activity = plugin.weak(activity)
+        caption = message.messageOwner.message if message.messageOwner is not None else message.caption
+        self.title = media_title(caption, message.getDocumentName())
+        self.cover = None
+        try:
+            card = plugin.card
+            if card is not None and card.cover_key == (player.player, message_key(message)):
+                self.cover = card.cover
+            if self.cover is None:
+                self.cover = loaded_video_cover(plugin, viewer)
+            if self.cover is None and plugin.viewer_texture_uploaded.getBoolean(viewer):
+                texture = viewer.getVideoTextureView()
+                if (texture is not None and texture.isAvailable()
+                        and texture.getWidth() > 0 and texture.getHeight() > 0):
+                    self.cover = texture.getBitmap(*cover_size(texture.getWidth(), texture.getHeight()))
+        except Exception as error:
+            plugin.log(f"Could not copy background audio artwork: {type(error).__name__}")
+        tag = plugin.application.getPackageName() + ".background-video." + uuid4().hex
+        self.action_names = {code: tag + "." + str(code) for code in (BACK, PLAY_PAUSE, FORWARD, STOP_AUDIO)}
+        self.pending = {
+            code: plugin.pending_intent.getService(
+                plugin.application, PENDING_REQUEST + code,
+                plugin.intent(plugin.application, plugin.music_service).setAction(action), 0x0C000000)
+            for code, action in self.action_names.items()
+        }
+        intent = plugin.intent(activity, plugin.launch)
+        dialog = message.getDialogId()
+        peer = f"user_id={dialog}" if dialog > 0 else f"chat_id={-dialog}"
+        intent.setAction("android.intent.action.VIEW")
+        intent.setData(plugin.uri.parse(f"tg://openmessage?{peer}&message_id={message.getId()}"))
+        intent.putExtra("currentAccount", jint(message.currentAccount))
+        intent.addFlags(0x30000000)
+        self.open_player = plugin.pending_intent.getActivity(activity, PENDING_REQUEST, intent, 0x0C000000)
+
+    def dispatch(self, action):
+        code = next((code for code, name in self.action_names.items() if action == name), None)
+        if code is None:
+            return False
+        plugin = self.plugin
+        if code == STOP_AUDIO:
+            plugin.stop_background()
+        elif code == PLAY_PAUSE:
+            if plugin.media.isMessagePaused():
+                plugin.media.playMessage(self.message)
+            else:
+                plugin.media.pauseMessage(self.message, False)
+        else:
+            duration = self.player.getDuration()
+            if duration > 0:
+                position = skip_position(self.player.getCurrentPosition(), duration, code)
+                plugin.media.seekToProgressMs(self.message, position)
+        return True
+
+    def publish_state(self, service, position):
+        plugin = self.plugin
+        playing = not plugin.media.isMessagePaused()
+        actions = tuple((self.action_names[code], label, icon)
+                        for code, label, icon in (*plugin.seek_actions,
+                                                  (STOP_AUDIO, "停止后台播放", plugin.stop_icon))
+                        if code == STOP_AUDIO or self.player.getDuration() > 0)
+        session = video_playback_state(plugin, service, self.player.player, playing, position, actions)
+        return session, playing
+
+    def publish(self, service):
+        plugin = self.plugin
+        session, playing = self.publish_state(service, self.player.getCurrentPosition())
+        session.setMetadata(video_metadata(plugin, self.title, "后台听视频", self.player.getDuration(), self.cover))
+        notification = media_notification(plugin, service, session, self.title, "后台听视频",
+                                          self.cover, self.open_player, True)
+        notification.setDeleteIntent(self.pending[STOP_AUDIO])
+        for code, label, resource in (*plugin.transport_buttons(playing),
+                                      (STOP_AUDIO, "停止后台播放", plugin.stop_icon)):
+            notification.addAction(resource, label, self.pending[code])
+        plugin.publish_music_notification(service, notification.build())
+
+
+class PlaybackCard:
+    def __init__(self, plugin, source):
+        self.plugin = plugin
+        self.source = source
+        self.tag = "nagramxf-video-" + uuid4().hex
+        self.last_publication = None
+        self.service_publication = None
+        self.shared_confirmation = None
+        self.shared_verified = None
+        self.native_publication = None
+        self.native_bindings = None
+        self.native_metadata = None
+        self.cover = None
+        self.cover_key = None
+        self.pending_cover = None
+        self.remote = None
+        self.remote_playing = None
+        self.listener = None
+        activity = source.controller.activity
+        intent = plugin.intent(activity, plugin.launch)
+        intent.setAction("android.intent.action.MAIN")
+        intent.addFlags(0x30000000)  # NEW_TASK | SINGLE_TOP
+        self.open_player = plugin.pending_intent.getActivity(activity, PENDING_REQUEST, intent,
+                                                            0x0C000000)
+        card = self
+
+        class Listener(dynamic_proxy(plugin.action_interface)):
+            def onPipAction(self, action_id):
+                card.on_action(action_id)
+
+        self.listener = Listener()
+        source.controller.addActionListener(self.tag, self.listener)
+
+    def on_action(self, action_id):
+        if not self.plugin.active or self.plugin.card is not self:
+            return
+        player = self.source.getPlayer()
+        if player is None:
+            return
+        if action_id in (BACK, FORWARD):
+            duration = player.getDuration()
+            if duration > 0:
+                self.seek_to(skip_position(player.getCurrentPosition(), duration, action_id))
+        elif action_id == PLAY_PAUSE:
+            self.set_playing(not is_playing(player))
+
+    def set_playing(self, should_play):
+        player = self.source.getPlayer()
+        if player is None:
+            return
+        if should_play:
+            if player.getPlaybackState() == STATE_ENDED:
+                player.seekTo(0)
+            player.play()
+        else:
+            player.pause()
+
+    def seek_to(self, position):
+        player = self.source.getPlayer()
+        if player is None or player.getDuration() <= 0:
+            return
+        position = min(max(0, position), player.getDuration())
+        player.seekTo(position)
+        service = self.plugin.active_music_service()
+        if service is not None and self.plugin.current_visual() is self:
+            self.publish_state(service, player, position)
+
+    def dispatch_session_action(self, name):
+        for code, _, _ in self.plugin.seek_actions:
+            if name == self.tag + str(code):
+                self.on_action(code)
+                return True
+        return False
+
+    def media_details(self, player):
+        viewer = self.source.delegate
+        message = viewer.getCurrentMessageObject()
+        caption = None
+        filename = None
+        if message is not None:
+            raw = message.messageOwner
+            caption = raw.message if raw is not None else message.caption
+            filename = message.getDocumentName()
+        key = player, message_key(message) if message is not None else int(viewer.getCurrentIndex())
+        return key, media_title(caption, filename)
+
+    def still_current(self, key):
+        plugin = self.plugin
+        player = self.source.getPlayer()
+        return (plugin.active and plugin.card is self and player is not None
+                and plugin.eligible(self.source.delegate) and self.media_details(player)[0] == key)
+
+    def read_thumbnail(self, viewer):
+        try:
+            return loaded_video_cover(self.plugin, viewer)
+        except Exception as error:
+            self.plugin.log(f"Could not copy video thumbnail ({type(error).__name__})")
+            return None
+
+    def capture_cover(self, key, attempt):
+        if not self.still_current(key) or self.cover is not None:
+            return
+        viewer = self.source.delegate
+        self.cover = self.read_thumbnail(viewer)
+        if self.cover is None and self.plugin.viewer_texture_uploaded.getBoolean(viewer):
+            try:
+                texture = viewer.getVideoTextureView()
+                if (texture is not None and texture.isAvailable()
+                        and texture.getWidth() > 0 and texture.getHeight() > 0):
+                    width, height = cover_size(texture.getWidth(), texture.getHeight())
+                    self.cover = texture.getBitmap(width, height)
+            except Exception as error:
+                self.plugin.log(f"Could not copy video texture ({type(error).__name__})")
+        if self.cover is not None:
+            self.publish_cover()
+            return
+        if self.pending_cover != key and self.plugin.viewer_frame_rendered.getBoolean(viewer):
+            surface = viewer.getVideoSurfaceView()
+            if (surface is not None and surface.getWidth() > 0 and surface.getHeight() > 0
+                    and surface.getHolder().getSurface().isValid()):
+                self.copy_cover_from_surface(key, surface)
+        if attempt is not None and attempt + 1 < len(COVER_RETRIES):
+            run_on_ui_thread(lambda: self.capture_cover(key, attempt + 1), COVER_RETRIES[attempt + 1])
+
+    def publish_cover(self):
+        try:
+            self.publish(self.source.getPlayer())
+        except Exception as error:
+            self.plugin.log(f"Could not publish video artwork ({type(error).__name__})")
+
+    def copy_cover_from_surface(self, key, surface):
+        plugin = self.plugin
+        width, height = cover_size(surface.getWidth(), surface.getHeight())
+        bitmap = plugin.bitmap.createBitmap(width, height, plugin.bitmap_config)
+        card = self
+
+        class CoverListener(dynamic_proxy(plugin.pixel_listener)):
+            def onPixelCopyFinished(self, result):
+                if card.pending_cover == key:
+                    card.pending_cover = None
+                if result == 0 and card.still_current(key) and card.cover is None:
+                    card.cover = bitmap
+                    card.publish_cover()
+                else:
+                    bitmap.recycle()
+
+        try:
+            self.pending_cover = key
+            plugin.pixel_copy.request(surface, bitmap, CoverListener(), plugin.ui_handler)
+        except Exception:
+            self.pending_cover = None
+            bitmap.recycle()
+
+    def publish_state(self, service, player, position):
+        plugin = self.plugin
+        actions = tuple((self.tag + str(code), label, icon) for code, label, icon in plugin.seek_actions
+                        if player.getDuration() > 0)
+        return video_playback_state(plugin, service, player, bool(is_playing(player)), position, actions)
+
+    def build_notification(self, context, session, player, title):
+        plugin = self.plugin
+        playing = bool(is_playing(player))
+        notification = media_notification(plugin, context, session, title, "NagramXF",
+                                          self.cover, self.open_player, playing)
+        for index, (_, label, resource) in enumerate(plugin.transport_buttons(playing)):
+            notification.addAction(resource, label, self.remote.get(index).getActionIntent())
+        return notification.build()
+
+    def publish_native(self):
+        plugin = self.plugin
+        controller = self.source.controller
+        session = plugin.session.get(controller)
+        player = self.source.getPlayer()
+        if session is None or player is None or self.remote is None:
+            return
+        signature = (session, self.last_publication)
+        if signature == self.native_publication:
+            return
+        _, title = self.media_details(player)
+        self.native_metadata = video_metadata(plugin, title, "NagramXF", player.getDuration(), self.cover)
+        connector = plugin.connector.get(controller)
+        if connector is not None:
+            if self.native_bindings is None or self.native_bindings[0] != connector:
+                self.clear_native_publication()
+                self.install_native_controls(connector)
+            connector.invalidateMediaSessionMetadata()
+        session.setMetadata(self.native_metadata)
+        # Both routes update the native music notification slot.
+        plugin.manager.notify(MUSIC_NOTIFICATION_ID,
+                              self.build_notification(controller.activity, session, player, title))
+        self.native_publication = signature
+
+    def install_native_controls(self, connector):
+        card, plugin = self, self.plugin
+
+        class Provider(dynamic_proxy(plugin.metadata_provider)):
+            def getMetadata(self, player):
+                return card.native_metadata
+
+            def sameAs(self, first, second):
+                return first == second
+
+        class SeekAction(dynamic_proxy(plugin.custom_action)):
+            def __init__(self, code, label, icon):
+                super().__init__()
+                self.code = code
+                self.button = plugin.action_builder(card.tag + str(code), label, icon).build()
+
+            def onCustomAction(self, player, action, extras):
+                card.on_action(self.code)
+
+            def getCustomAction(self, player):
+                return self.button if player.getDuration() > 0 else None
+
+        previous_provider = plugin.connector_provider.get(connector)
+        previous_actions = plugin.connector_actions.get(connector)
+        provider = Provider()
+        actions = plugin.custom_actions(list(previous_actions) + [SeekAction(*action) for action in plugin.seek_actions])
+        self.native_bindings = (connector, previous_provider, previous_actions, provider, actions)
+        connector.setMediaMetadataProvider(provider)
+        connector.setCustomActionProviders(actions)
+
+    def clear_native_publication(self):
+        bindings, self.native_bindings = self.native_bindings, None
+        self.native_publication = None
+        if bindings is None:
+            return
+        connector, previous_provider, previous_actions, provider, actions = bindings
+        plugin = self.plugin
+        if plugin.connector.get(self.source.controller) == connector:
+            if plugin.connector_provider.get(connector) == provider:
+                connector.setMediaMetadataProvider(previous_provider)
+            if plugin.connector_actions.get(connector) == actions:
+                connector.setCustomActionProviders(previous_actions)
+
+    def publish_service(self, service):
+        player = self.source.getPlayer()
+        if player is None or self.remote is None:
+            return False
+        signature = (service, self.last_publication)
+        if signature == self.service_publication:
+            return True
+        plugin = self.plugin
+        _, title = self.media_details(player)
+        session = self.publish_state(service, player, player.getCurrentPosition())
+        session.setMetadata(video_metadata(plugin, title, "NagramXF", player.getDuration(), self.cover))
+        plugin.publish_music_notification(service, self.build_notification(service, session, player, title))
+        self.service_publication = signature
+        return True
+
+    def publish(self, player):
+        if player is None:
+            return
+        plugin = self.plugin
+        playing = bool(is_playing(player))
+        key, title = self.media_details(player)
+        if self.cover_key != key and plugin.option("media_controls"):
+            self.cover_key, self.cover = key, self.read_thumbnail(self.source.delegate)
+            if self.cover is None:
+                run_on_ui_thread(lambda: self.capture_cover(key, 0), COVER_RETRIES[0])
+        duration = player.getDuration()
+        signature = (key, title, playing, duration, self.cover is not None)
+        if self.remote is None or self.remote_playing != playing:
+            activity = self.source.controller.activity
+            actions = plugin.array_list()
+            for code, label, resource in plugin.transport_buttons(playing):
+                icon = plugin.icon.createWithResource(activity, resource)
+                actions.add(plugin.pip_action.create(activity, self.tag, code, label, label, icon))
+            self.remote = actions
+            self.remote_playing = playing
+            if plugin.option("system_pip"):
+                plugin.pip_utils.applyPictureInPictureParams(activity, self.source)
+        self.last_publication = signature
+        plugin.update_visual_card(self, playing)
+
+    def close(self):
+        self.clear_native_publication()
+        if self.listener is not None:
+            self.source.controller.removeActionListener(self.tag, self.listener)

@@ -1,19 +1,17 @@
-# TG快点滑 · NagramXF
+# NagramXF 插件合集
 
-TG 快点滑的 NagramXF 内置插件版。从聊天或频道里打开单张图片或视频时，插件会优先加载当前媒体附近的记录，方便滑到相邻媒体。
-
-## 实测
-
-- **NagramXF 12.10.1.1251 ARM64 插件版，Android 16**
-- 启用插件后，冷启动约 **1.1 秒**。
-- 打开公开频道的一条旧视频时，从发出媒体查询到投递 **39 条媒体**约 **0.29 秒**，实测能滑到相邻视频。耗时为这次测试的记录。
+一个 `.plugin` 包含 TG 快点滑、AyuGram 过滤显示修复以及视频和音乐播放工具。安装后可在插件设置中单独开关各项功能。
 
 ## 安装
 
-1. 从 [Release 的 Assets](../../releases/latest) 下载 `tgfastviewer_nagramxf.plugin`。
-2. 打开 **NagramXF → N-设置 → 插件**，确认插件引擎已启用。
-3. 点右上角 **＋**，选中下载的文件，勾选 **安装后启用**，再点 **安装插件**。
+1. 从 [GitHub Releases](https://github.com/ztszts777/tgfastviewer-nagramxf/releases) 下载 `nagramxf_media_suite.plugin`。
+2. 在 NagramXF 打开「N-设置 → 插件」，点「＋」选择下载的文件。已有同名媒体工具插件时，选择更新。
+3. 如果之前单独安装过 TG 快点滑、AyuGram 显示修复，或独立的进度条、定时、画中画插件，先禁用旧插件，再启用合集，避免同一功能执行两次。
 
-如果之前用过 **TG 快点滑 · NagramXF 的 LSPosed APK**，先在 **LSPosed 管理器 → 模块**里关闭该模块，再强制停止并重新打开 NagramXF。实测旧模块会让该版本的 NagramXF 卡在启动遮罩。
+本版已通过 Python 回归测试，并核对 NagramXF `12.10.1.1251`（构建 `30dcd6c`，插件版，arm64-v8a）的 APK 接口。新版的画中画贴边行为还需在手机上验证。
 
-原作者为 **dunxuan**。插件文件内含完整 MIT 许可证与原作者版权声明。[原项目](https://github.com/dunxuan/tgfastviewer) · [实测客户端版本](https://github.com/Keeperorowner/NagramXF/releases/tag/1251)
+## 源码与许可
+
+发布附件是可读的 Python 源码，也可以直接安装。维护用的各模块源码在 `plugins/`。在仓库根目录运行 `python tools/build_media_suite.py`，可以重新生成 `plugins/nagramxf_media_suite.plugin`。
+
+合集以 [GPLv3](LICENSE) 发布。TGFastViewer 由 dunxuan 创建，原代码的 [MIT 声明](LICENSES/TGFastViewer-MIT.txt) 随插件附带。此前按 MIT 发布的 [v1.0.1](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.0.1) 继续适用原许可。

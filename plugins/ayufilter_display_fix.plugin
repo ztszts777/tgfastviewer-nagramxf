@@ -1,0 +1,1143 @@
+from collections import OrderedDict
+from time import monotonic
+
+from android_utils import R, run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import RequestCallback
+from java import jarray, jclass
+
+
+__id__ = "ayufilter_display_fix"
+__name__ = "AyuGram 消息过滤显示修复"
+__description__ = "修复过滤后的日期、聊天预览、置顶消息和共享媒体列表，沿用聊天自己的过滤规则。"
+__author__ = "Codex"
+__version__ = "1.0.6"
+__app_version__ = ">=12.10.1"
+
+PAGE_SIZE = 32
+HIDDEN_ROW = -1000
+DENSE_MEDIA_TABS = (0, 1, 2, 4)
+FAST_VIEWER_PAGE_INDEX = -1000000
+PINNED_CHAT_MODE = 2
+
+
+def field(owner, name):
+    result = owner.getDeclaredField(name)
+    result.setAccessible(True)
+    return result
+
+
+def method(owner, name, arity):
+    result, = (m for m in owner.getDeclaredMethods()
+               if m.getName() == name and len(m.getParameterTypes()) == arity)
+    result.setAccessible(True)
+    return result
+
+
+def media_cursor(mid, maximum, minimum, encrypted):
+    if encrypted:
+        return max(mid, maximum), min(mid, minimum)
+    if mid > 0:
+        return min(mid, maximum), max(mid, minimum)
+    return maximum, minimum
+
+
+def day_has_visible_message(messages, index, day, visible):
+    for step in (-1, 1):
+        offset = index + step
+        while 0 <= offset < messages.size():
+            msg = messages.get(offset)
+            if (msg is not None and msg.messageOwner is not None
+                    and not msg.isDateObject and msg.contentType != 2 and msg.getId() != 0):
+                if msg.dateKeyInt != day:
+                    break
+                if visible(offset):
+                    return True
+            offset += step
+    return False
+
+
+class AlbumPages:
+    def __init__(self):
+        self.pending = []
+
+    def consume(self, batch, choose, *, end=False):
+        for raw in batch:
+            if self.pending and (not raw.grouped_id
+                                 or raw.grouped_id != self.pending[0].grouped_id):
+                match = choose(self.pending)
+                if match is not None:
+                    return match
+                self.pending = []
+            if raw.grouped_id:
+                self.pending.append(raw)
+            else:
+                match = choose([raw])
+                if match is not None:
+                    return match
+        if end and self.pending:
+            album, self.pending = self.pending, []
+            return choose(album)
+        return None
+
+
+class AyuFilterDisplayFix(BasePlugin):
+    def on_plugin_load(self):
+        self.active = True
+        self.date_adapter = None
+        self.date_visibility = {}
+        self.date_refresh_pending = False
+        self.cells = {}
+        self.attached = {}
+        self.layouts = []
+        self.pinned_chats = []
+        self.pinned_frames = []
+        self.cache = OrderedDict()
+        self.queued = OrderedDict()
+        self.running = {}
+        self.hooks = []
+        self.weak = jclass("java.lang.ref.WeakReference")
+        self.system = jclass("java.lang.System")
+        self.integer = jclass("java.lang.Integer")
+        self.original = jclass("de.robv.android.xposed.XposedBridge").invokeOriginalMethod
+        self.object_array = jarray(jclass("java.lang.Object"))
+        self.ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
+        self.mc = jclass("org.telegram.messenger.MessagesController")
+        self.chat_object = jclass("org.telegram.messenger.ChatObject")
+        self.dialog_object = jclass("org.telegram.messenger.DialogObject")
+        self.storage = jclass("org.telegram.messenger.MessagesStorage")
+        self.conn = jclass("org.telegram.tgnet.ConnectionsManager")
+        self.history = jclass("org.telegram.tgnet.TLRPC$TL_messages_getHistory")
+        self.empty_message = jclass("org.telegram.tgnet.TLRPC$TL_messageEmpty").getClass()
+        self.message = jclass("org.telegram.messenger.MessageObject")
+        self.album = jclass("org.telegram.messenger.MessageObject$GroupedMessages")
+        chat = jclass("org.telegram.ui.ChatActivity").getClass()
+        adapter = jclass("org.telegram.ui.ChatActivity$ChatActivityAdapter").getClass()
+        cell = jclass("org.telegram.ui.Cells.DialogCell").getClass()
+        dialogs = jclass("org.telegram.ui.DialogsActivity").getClass()
+        events = jclass("org.telegram.messenger.NotificationCenter")
+        self.filters_changed = events.regexFiltersUpdated
+        self.messages_deleted = events.messagesDeleted
+        self.date_events = {events.messagesDidLoad, events.didReceiveNewMessages,
+                            events.messagesDeleted, events.replaceMessagesObjects}
+        self.pinned_events = {events.pinnedInfoDidLoad, events.didLoadPinnedMessages}
+        self.adapter = field(chat, "chatAdapter")
+        self.hide_mode = field(chat, "hideFilteredMessages")
+        self.pinned_ids = field(chat, "pinnedMessageIds")
+        self.pinned_objects = field(chat, "pinnedMessageObjects")
+        self.message_dict = field(chat, "messagesDict")
+        self.current_pin = field(chat, "currentPinnedMessageId")
+        self.pin_index = field(chat, "currentPinnedMessageIndex")
+        self.loaded_pin_count = field(chat, "loadedPinnedMessagesCount")
+        self.total_pin_count = field(chat, "totalPinnedMessagesCount")
+        self.find_pin = method(chat, "findClosest", 3)
+        self.hide_pin_view = method(chat, "hidePinnedMessageView", 1)
+        self.check_pin_paddings = method(chat, "checkListViewPaddings", 0)
+        self.reply_header = field(chat, "replyMessageHeaderObject")
+        self.outer = field(adapter, "this$0")
+        self.start = field(adapter, "messagesStartRow")
+        self.end = field(adapter, "messagesEndRow")
+        self.account = field(cell, "currentAccount")
+        self.cell_message = field(cell, "message")
+        self.cell_group = field(cell, "groupMessages")
+        self.cell_date = field(cell, "lastMessageDate")
+        self.dummies = field(cell, "filteredDummyMessages").get(None)
+        self.view_type = method(adapter, "getItemViewType", 1)
+        self.hooks.append(self.hook_method(self.view_type, after=self.after_view_type))
+        self.hooks.append(self.hook_method(method(chat, "didReceivedNotification", 3),
+                                           after=self.after_chat_event))
+        self.hooks.append(self.hook_method(self.find_pin, after=self.after_choose_pin))
+        for name, arity, role in (("updatePinnedMessageView", 2, "banner"),
+                                  ("updatePinnedListButton", 1, "button"),
+                                  ("openPinnedMessagesList", 1, "open")):
+            self.hooks.append(self.hook_method(method(chat, name, arity),
+                                               before=lambda param, role=role: self.before_pinned_ui(param, role),
+                                               after=self.after_pinned_ui))
+        chat_constructor = chat.getDeclaredConstructor(jclass("android.os.Bundle").getClass())
+        chat_constructor.setAccessible(True)
+        self.hooks.append(self.hook_method(chat_constructor, after=self.inherit_pinned_filter))
+        self.hooks.append(self.hook_method(method(adapter, "notifyDataSetChanged", 1),
+                                           after=self.after_pinned_mode_change))
+        self.hooks.append(self.hook_method(method(chat, "getPinnedMessagesCount", 0),
+                                           after=self.after_pinned_count))
+        self.hooks.append(self.hook_method(method(cell, "buildLayout", 0),
+                                           before=self.before_layout, after=self.after_layout))
+        self.hooks.append(self.hook_method(method(cell, "onAttachedToWindow", 0),
+                                           after=self.after_cell_attach))
+        self.hooks.append(self.hook_method(method(dialogs, "didReceivedNotification", 3),
+                                           after=self.after_dialogs_event))
+        layout = jclass("org.telegram.ui.Components.SharedMediaLayout").getClass()
+        page = jclass("org.telegram.ui.Components.SharedMediaLayout$MediaPage").getClass()
+        shared = jclass("org.telegram.ui.Components.SharedMediaLayout$SharedMediaData").getClass()
+        search = jclass("org.telegram.ui.Components.SharedMediaLayout$MediaSearchAdapter").getClass()
+        photos = jclass("org.telegram.ui.Components.SharedMediaLayout$SharedPhotoVideoAdapter").getClass()
+        documents = jclass("org.telegram.ui.Components.SharedMediaLayout$SharedDocumentsAdapter").getClass()
+        viewer = jclass("org.telegram.ui.PhotoViewer").getClass()
+        self.media_controller = jclass("org.telegram.messenger.MediaDataController")
+        self.java_list = jclass("java.util.ArrayList")
+        self.java_boolean = jclass("java.lang.Boolean")
+        self.shared_data = field(layout, "sharedMediaData")
+        self.shared_preloader = field(layout, "sharedMediaPreloader")
+        self.photo_adapter = field(layout, "photoVideoAdapter")
+        self.supporting_photo_adapter = field(layout, "animationSupportingPhotoVideoAdapter")
+        self.media_adapters = {0: self.photo_adapter, 1: field(layout, "documentsAdapter"),
+                               2: field(layout, "voiceAdapter"), 4: field(layout, "audioAdapter")}
+        self.photo_outer = field(photos, "this$0")
+        self.document_outer = field(documents, "this$0")
+        self.document_type = field(documents, "currentType")
+        self.media_dialog = field(layout, "dialog_id")
+        self.media_merge = field(layout, "mergeDialogId")
+        self.media_messages = field(shared, "messages")
+        self.media_loading = field(shared, "loading")
+        self.media_start = field(shared, "startOffset")
+        self.media_frozen_start = field(shared, "frozenStartOffset")
+        self.media_request = field(shared, "requestIndex")
+        self.viewer_dialog = field(viewer, "currentDialogId")
+        self.viewer_merge = field(viewer, "mergeDialogId")
+        self.viewer_topic = field(viewer, "topicId")
+        self.viewer_chat = field(viewer, "parentChatActivity")
+        self.viewer_media_type = field(viewer, "sharedMediaType")
+        self.viewer_tag = field(viewer, "currentFilterTag")
+        self.media_max = field(shared, "max_id")
+        self.media_min = field(shared, "min_id")
+        self.media_results = field(search, "searchResult")
+        self.media_remote = field(search, "globalSearch")
+        self.media_pages = field(layout, "mediaPages")
+        self.media_parent = field(layout, "profileActivity")
+        self.media_list = field(page, "listView")
+        self.media_selected = field(page, "selectedType")
+        self.media_more = method(layout, "checkLoadMoreScroll", 3)
+        self.media_event = events.mediaDidLoad
+        self.media_cached_lists = []
+        self.media_layouts = []
+        self.filtered_media_data = []
+        self.checked_media_data = []
+        self.viewer_cursors = {}
+        self.hooks.append(self.hook_method(method(shared, "addMessage", 4), before=self.before_media_add))
+        for name in ("getItemCount", "getTotalItemsCount"):
+            self.hooks.append(self.hook_method(method(photos, name, 0), after=self.after_photo_count))
+            self.hooks.append(self.hook_method(method(documents, name, 0), after=(
+                lambda param, empty_row=name == "getItemCount": self.after_document_count(param, empty_row))))
+        self.hooks.append(self.hook_method(method(layout, "fillMediaData", 1), after=self.after_fill_media))
+        self.hooks.append(self.hook_method(method(layout, "jumpToDate", 4), before=self.before_media_jump,
+                                           after=self.after_media_jump))
+        self.hooks.append(self.hook_method(method(search, "getItemCount", 0), before=self.before_media_count))
+        self.hooks.append(self.hook_method(method(layout, "didReceivedNotification", 3),
+                                           after=self.after_media_page))
+        self.hooks.append(self.hook_method(method(viewer, "openPhoto", 16),
+                                           before=self.before_viewer_open))
+        self.hooks.append(self.hook_method(method(viewer, "addPhoto", 2), before=self.before_viewer_add))
+        self.hooks.append(self.hook_method(method(chat, "getFilteredMessages", 0),
+                                           after=self.after_chat_media_list))
+        self.hooks.append(self.hook_method(method(viewer, "didReceivedNotification", 3),
+                                           priority=100, before=self.before_viewer_page))
+        self.hooks.append(self.hook_method(method(viewer, "onPhotoClosed", 1),
+                                           before=self.clear_viewer_cursors))
+        for name, arity in (("rebuildCache", 0), ("invalidateFilteredCache", 0),
+                            ("onMessageEdited", 2)):
+            self.hooks.append(self.hook_method(method(self.ayu.getClass(), name, arity),
+                                               after=self.after_filter_change))
+
+    def media_hidden(self, message, chat=None, group=None):
+        if message is None or message.messageOwner is None:
+            return False
+        if message.isRestrictedMessage or message.isHiddenSensitive():
+            return True
+        dialog = message.getDialogId()
+        if self.ayu.isDialogExcluded(dialog):
+            return False
+        if message.messageOwner.hide:
+            return True
+        if chat is not None and not self.hide_mode.getBoolean(chat):
+            return False
+        group_id = message.getGroupId()
+        if group is None and group_id and chat is not None:
+            group = chat.getGroup(group_id)
+        primary = group.findPrimaryMessageObject() if group is not None else None
+        primary = primary if primary is not None else message
+        if self.ayu.shouldMaskMessage(primary, group):
+            return True
+        if not self.ayu.shouldHideFilteredMessages():
+            return False
+        if self.ayu.shouldHideIgnoredBlockedMessages() and dialog < 0:
+            peer = self.mc.getInstance(message.currentAccount).getChat(-dialog)
+            if self.chat_object.isMegagroup(peer) and self.ayu.isIgnoredBlockedMessage(message):
+                return True
+        return self.ayu.shouldHideFilteredMessage(primary, group)
+
+    def before_media_add(self, param):
+        message, index, _, encrypted = param.args
+        if not self.media_hidden(message):
+            return
+        data = param.thisObject
+        offsets = self.media_max.get(data)
+        index = int(index)
+        maximum, minimum = media_cursor(message.getId(), offsets[index],
+                                        self.media_min.getInt(data), bool(encrypted))
+        offsets[index] = maximum
+        self.media_min.setInt(data, minimum)
+        self.remember_media_ref(self.filtered_media_data, data)
+        param.setResult(self.java_boolean(False))
+
+    def remember_media_ref(self, references, value):
+        references[:] = [ref for ref in references if ref.get() is not None]
+        if not any(ref.get() == value for ref in references):
+            references.append(self.weak(value))
+
+    def uses_compact_grid(self, layout, data):
+        if self.has_suppressed_media(data):
+            return True
+        dialog = self.media_dialog.getLong(layout)
+        merge = self.media_merge.getLong(layout)
+        eligible = not self.ayu.isDialogExcluded(dialog) or (merge != 0 and not self.ayu.isDialogExcluded(merge))
+        return eligible and (self.ayu.shouldHideFilteredMessages() or self.ayu.shouldHideIgnoredBlockedMessages()
+                             or self.ayu.shouldMaskFilteredMessages())
+
+    def has_suppressed_media(self, data):
+        return any(ref.get() == data for ref in self.filtered_media_data)
+
+    def after_photo_count(self, param):
+        layout = self.photo_outer.get(param.thisObject)
+        if param.thisObject not in (self.photo_adapter.get(layout), self.supporting_photo_adapter.get(layout)):
+            return
+        self.apply_dense_count(param, layout, 0)
+
+    def after_document_count(self, param, empty_row):
+        adapter = param.thisObject
+        self.apply_dense_count(param, self.document_outer.get(adapter), self.document_type.getInt(adapter), empty_row)
+
+    def apply_dense_count(self, param, layout, kind, empty_row=False):
+        datasets = self.shared_data.get(layout)
+        if datasets is None or datasets[kind] is None:
+            return
+        data = datasets[kind]
+        self.remember_media_ref(self.media_layouts, layout)
+        self.check_existing_media(layout, kind, data)
+        if self.uses_compact_grid(layout, data):
+            self.media_start.setInt(data, 0)
+            self.media_frozen_start.setInt(data, 0)
+            count = data.getMessages().size()
+            if empty_row and count == 0 and not self.media_loading.getBoolean(data):
+                count = 1
+            param.setResult(self.integer(count))
+
+    def check_existing_media(self, layout, kind, data):
+        if layout.getParent() is None or any(ref.get() == data for ref in self.checked_media_data):
+            return
+        self.remember_media_ref(self.checked_media_data, data)
+
+        def check():
+            if (self.active and layout.getParent() is not None and self.shared_data.get(layout)[kind] == data
+                    and self.prune_loaded_media(layout, data)):
+                self.media_data_compacted(layout, kind)
+                self.continue_media_page(layout, kind)
+
+        run_on_ui_thread(check, 1)
+
+    def media_data_compacted(self, layout, kind):
+        adapter = self.media_adapters[kind].get(layout)
+        if adapter is not None:
+            adapter.notifyDataSetChanged()
+
+    def prune_loaded_media(self, layout, data):
+        removed, _ = self.prune_media_items(layout, data, self.media_messages.get(data))
+        return removed
+
+    def prune_media_items(self, layout, data, messages):
+        merge = int(self.media_merge.getLong(layout))
+        removed = hidden = False
+        for index in range(messages.size() - 1, -1, -1):
+            item = messages.get(index)
+            if self.media_hidden(item):
+                hidden = True
+                load_index = 1 if merge and item.getDialogId() == merge else 0
+                if data.deleteMessage(item.getId(), load_index) is not None:
+                    removed = True
+        if hidden:
+            self.remember_media_ref(self.filtered_media_data, data)
+        return removed, hidden
+
+    def after_fill_media(self, param):
+        layout, kind = param.thisObject, int(param.args[0])
+        data = self.shared_data.get(layout)[kind]
+        preloader = self.shared_preloader.get(layout)
+        copied = preloader.getSharedMediaData() if preloader is not None else None
+        if data is not None and copied is not None and self.has_suppressed_media(copied[kind]):
+            self.remember_media_ref(self.filtered_media_data, data)
+        if data is not None and self.prune_loaded_media(layout, data):
+            param.setResult(self.java_boolean(self.media_messages.get(data).size() > 0))
+        if data is not None:
+            self.remember_media_ref(self.checked_media_data, data)
+
+    def before_media_jump(self, param):
+        kind = int(param.args[0])
+        if kind in DENSE_MEDIA_TABS:
+            layout = param.thisObject
+            if self.uses_compact_grid(layout, self.shared_data.get(layout)[kind]):
+                param.args[2] = self.integer(0)
+
+    def after_media_jump(self, param):
+        kind = int(param.args[0])
+        if kind in DENSE_MEDIA_TABS:
+            layout = param.thisObject
+            if self.uses_compact_grid(layout, self.shared_data.get(layout)[kind]):
+                self.continue_media_page(layout, kind)
+
+    def viewer_batch_groups(self, messages, chat):
+        buckets = {}
+        if chat is not None and not self.hide_mode.getBoolean(chat):
+            return buckets
+        if not (self.ayu.shouldHideFilteredMessages() or self.ayu.shouldMaskFilteredMessages()):
+            return buckets
+        for index in range(messages.size()):
+            item = messages.get(index)
+            group_id = item.getGroupId()
+            if group_id:
+                buckets.setdefault((item.getDialogId(), group_id), []).append(item)
+        groups = {}
+        for (dialog, group_id), members in buckets.items():
+            native = chat.getGroup(group_id) if chat is not None else None
+            if native is not None:
+                groups[dialog, group_id] = native
+            elif len(members) > 1:
+                album = self.album()
+                album.groupId = group_id
+                for item in members:
+                    album.messages.add(item)
+                album.calculate()
+                groups[dialog, group_id] = album
+        return groups
+
+    def split_visible_media(self, messages, chat=None, *, albums=False):
+        visible = self.java_list()
+        hidden_ids = []
+        groups = self.viewer_batch_groups(messages, chat) if albums else {}
+        for index in range(messages.size()):
+            item = messages.get(index)
+            group = groups.get((item.getDialogId(), item.getGroupId())) if groups else None
+            if self.media_hidden(item, chat, group):
+                hidden_ids.append(int(item.getId()))
+            else:
+                visible.add(item)
+        return visible, hidden_ids
+
+    def before_viewer_open(self, param):
+        args = param.args
+        message, messages, index, chat = args[0], args[4], int(args[7]), args[9]
+        if messages is None or not 0 <= index < messages.size():
+            if message is not None and self.media_hidden(message, chat):
+                param.setResult(self.java_boolean(False))
+            return
+        if chat is None:
+            parent = self.viewer_chat.get(param.thisObject)
+            if parent is not None and parent.getDialogId() == int(args[10]):
+                chat = parent
+        selected = messages.get(index)
+        visible, hidden = self.split_visible_media(messages, chat, albums=True)
+        if hidden:
+            new_index = visible.indexOf(selected)
+            if new_index < 0:
+                param.setResult(self.java_boolean(False))
+                return
+            args[7] = self.integer(new_index)
+            args[4] = visible
+
+    def before_viewer_add(self, param):
+        viewer = param.thisObject
+        if int(param.args[1]) == viewer.getClassGuid() and self.media_hidden(
+                param.args[0], self.viewer_chat.get(viewer)):
+            param.setResult(None)
+
+    def after_chat_media_list(self, param):
+        results = param.getResult()
+        if results is not None:
+            visible, hidden = self.split_visible_media(results, param.thisObject, albums=True)
+            if hidden:
+                param.setResult(visible)
+
+    def before_viewer_page(self, param):
+        if int(param.args[0]) != self.media_event:
+            return
+        viewer, args = param.thisObject, param.args[2]
+        if len(args) < 8:
+            return
+        dialog, guid = int(args[0]), int(args[3])
+        if not dialog or dialog not in (
+                int(self.viewer_dialog.getLong(viewer)), int(self.viewer_merge.getLong(viewer))):
+            return
+        # TG Fast Viewer routes its own pages through this event before appending them.
+        fast_page = (guid <= FAST_VIEWER_PAGE_INDEX and guid == int(args[7]) and viewer.isVisible()
+                     and int(args[4]) == self.viewer_media_type.getInt(viewer))
+        if guid != int(viewer.getClassGuid()) and not fast_page:
+            return
+        visible, hidden = self.split_visible_media(args[2], self.viewer_chat.get(viewer), albums=True)
+        if not hidden:
+            return
+        payload = self.object_array([None] * len(args))
+        self.system.arraycopy(args, 0, payload, 0, len(args))
+        payload[2] = visible
+        param.args[2] = payload
+        if not fast_page and not visible.size() and not bool(args[5]):
+            from_start = bool(args[6])
+            encrypted = self.dialog_object.isEncryptedDialog(dialog)
+            towards_larger_id = from_start != encrypted
+            ids = [mid for mid in hidden if mid != 0]
+            if not ids:
+                return
+            cursor = (max if towards_larger_id else min)(ids)
+            key = guid, dialog, from_start
+            last = self.viewer_cursors.get(key)
+            if last is not None and (cursor <= last if towards_larger_id else cursor >= last):
+                return
+            try:
+                self.media_controller.getInstance(int(param.args[1])).loadMedia(
+                    dialog, 40, 0 if from_start else cursor, cursor if from_start else 0,
+                    int(args[4]), int(self.viewer_topic.getLong(viewer)), 1, guid, int(args[7]),
+                    self.viewer_tag.get(viewer), None)
+                self.viewer_cursors[key] = cursor
+                param.setResult(None)
+            except Exception as error:
+                self.log(f"Filtered gallery could not continue: {type(error).__name__}")
+
+    def clear_viewer_cursors(self, param):
+        guid = int(param.thisObject.getClassGuid())
+        self.viewer_cursors = {key: cursor for key, cursor in self.viewer_cursors.items() if key[0] != guid}
+
+    def before_media_count(self, param):
+        adapter = param.thisObject
+        for result_field in (self.media_results, self.media_remote):
+            messages = result_field.get(adapter)
+            if messages is None:
+                continue
+            size = messages.size()
+            identity = int(self.system.identityHashCode(messages))
+            if any(ref.get() == messages and cached == (identity, size)
+                   for ref, cached in self.media_cached_lists):
+                continue
+            for index in range(size - 1, -1, -1):
+                if self.media_hidden(messages.get(index)):
+                    # remove(int) and remove(Object) have different semantics.
+                    messages.remove(index)
+            self.media_cached_lists = [(ref, cached) for ref, cached in self.media_cached_lists
+                                       if ref.get() is not None and cached[0] != identity]
+            self.media_cached_lists.append((self.weak(messages), (identity, messages.size())))
+
+    def after_media_page(self, param):
+        if int(param.args[0]) != self.media_event:
+            return
+        layout, args = param.thisObject, param.args[2]
+        if len(args) < 8:
+            return
+        if int(args[3]) != self.media_parent.get(layout).getClassGuid():
+            return
+        kind = int(args[4])
+        if kind in (6, 7):
+            kind = 0
+        data = self.shared_data.get(layout)[kind]
+        if int(args[7]) != self.media_request.getInt(data):
+            return
+        messages = args[2]
+        if messages is None:
+            return
+        if kind in DENSE_MEDIA_TABS:
+            removed, hidden = self.prune_media_items(layout, data, messages)
+            if removed:
+                self.media_data_compacted(layout, kind)
+        else:
+            hidden = any(self.media_hidden(messages.get(i)) for i in range(messages.size()))
+        if hidden and not bool(args[5]):
+            self.continue_media_page(layout, kind)
+
+    def continue_media_page(self, layout, kind):
+        def continue_visible():
+            if not self.active or layout.getParent() is None:
+                return
+            page = self.media_pages.get(layout)[0]
+            if page is None or self.media_selected.getInt(page) != kind:
+                return
+            listing = self.media_list.get(page)
+            if listing is not None and listing.getLayoutManager() is not None:
+                self.media_more.invoke(layout, self.object_array(
+                    [page, listing, listing.getLayoutManager()]))
+
+        run_on_ui_thread(continue_visible, 8)
+
+    def position_type(self, adapter, position):
+        return int(self.original(self.view_type, adapter,
+                                 self.object_array([self.integer(position)])))
+
+    def pinned_hidden(self, chat, message):
+        if message is None or message.messageOwner is None:
+            return False
+        group = None
+        if message.getGroupId():
+            group = chat.getGroup(message.getGroupId())
+            if group is None:
+                group = chat.getValidGroupedMessage(message)
+        primary = group.findPrimaryMessageObject() if group is not None else None
+        primary = primary if primary is not None else message
+        previous = primary.skipAyuFiltering
+        primary.skipAyuFiltering = not self.hide_mode.getBoolean(chat)
+        try:
+            return self.media_hidden(message, chat, group)
+        finally:
+            primary.skipAyuFiltering = previous
+
+    def pinned_message(self, chat, mid):
+        entry = self.pinned_objects.get(chat).get(self.integer(mid))
+        return entry if entry is not None else self.message_dict.get(chat)[0].get(mid)
+
+    def visible_pins(self, chat, source):
+        visible = self.java_list()
+        loaded = self.java_list()
+        for i in range(source.size()):
+            mid = int(source.get(i))
+            message = self.pinned_message(chat, mid)
+            if not self.pinned_hidden(chat, message):
+                boxed = self.integer(mid)
+                visible.add(boxed)
+                if message is not None:
+                    loaded.add(boxed)
+        return visible, loaded
+
+    def nearest_pin(self, chat, visible, loaded, target, index):
+        candidates = visible if loaded.isEmpty() else loaded
+        return int(self.original(self.find_pin, chat,
+                                 self.object_array([candidates, self.integer(target), index])))
+
+    def after_choose_pin(self, param):
+        chat = param.thisObject
+        source, target, index = param.args
+        if chat.getChatMode() != 0 or source != self.pinned_ids.get(chat):
+            return
+        mid = int(param.getResult())
+        if not mid or not self.pinned_hidden(chat, self.pinned_message(chat, mid)):
+            return
+        visible, loaded = self.visible_pins(chat, source)
+        replacement = self.nearest_pin(chat, visible, loaded, int(target), index)
+        index[0] = source.indexOf(self.integer(replacement)) if replacement else max(0, source.size() - 1)
+        param.setResult(self.integer(replacement))
+
+    def watch_pinned_chat(self, chat):
+        self.pinned_chats = [record for record in self.pinned_chats if record[0].get() is not None]
+        record = next((entry for entry in self.pinned_chats if entry[0].get() == chat), None)
+        if record is None:
+            record = [self.weak(chat), self.hide_mode.getBoolean(chat)]
+            self.pinned_chats.append(record)
+        return record
+
+    def native_pin_dismissed(self, chat, source):
+        preferences = self.mc.getNotificationsSettings(chat.getCurrentAccount())
+        return preferences.getInt(f"pin_{chat.getDialogId()}", 0) == int(source.get(0))
+
+    def before_pinned_ui(self, param, role):
+        chat = param.thisObject
+        frame = [chat, role, None]
+        self.pinned_frames.append(frame)
+        if chat.getChatMode() != 0:
+            return
+        self.watch_pinned_chat(chat)
+        if (role == "banner" and chat.isThreadChat() and not chat.isTopic
+                and self.pinned_hidden(chat, chat.getThreadMessage())):
+            if self.original(self.hide_pin_view, chat, self.object_array([self.java_boolean(False)])):
+                self.original(self.check_pin_paddings, chat, self.object_array([]))
+            param.setResult(None)
+            return
+        source = self.pinned_ids.get(chat)
+        if source.isEmpty():
+            return
+        visible, loaded = self.visible_pins(chat, source)
+        if visible.size() == source.size():
+            return
+        # NagramXF stores dismissal against the newest original pin.
+        if role == "banner" and self.native_pin_dismissed(chat, source):
+            return
+        frame[2] = (source, visible, self.loaded_pin_count.getInt(chat), self.total_pin_count.getInt(chat))
+        self.pinned_ids.set(chat, visible)
+        if role != "button":
+            self.loaded_pin_count.setInt(chat, visible.size())
+            self.total_pin_count.setInt(chat, visible.size())
+        if role == "banner":
+            index = self.pin_index.get(chat)
+            mid = self.current_pin.getInt(chat)
+            if mid and not visible.contains(self.integer(mid)):
+                mid = self.nearest_pin(chat, visible, loaded, mid, index)
+                self.current_pin.setInt(chat, mid)
+            index[0] = max(0, visible.indexOf(self.integer(mid)))
+            param.args[0], param.args[1] = self.java_boolean(False), self.integer(0)
+
+    def after_pinned_ui(self, param):
+        chat, role, projection = self.pinned_frames.pop()
+        if projection is None:
+            return
+        source, visible, loaded, total = projection
+        if self.pinned_ids.get(chat) != visible:
+            return
+        self.pinned_ids.set(chat, source)
+        if role != "button":
+            self.loaded_pin_count.setInt(chat, loaded)
+            self.total_pin_count.setInt(chat, total)
+        if role == "banner":
+            index = self.pin_index.get(chat)
+            index[0] = max(0, source.indexOf(self.integer(self.current_pin.getInt(chat))))
+
+    def inherit_pinned_filter(self, param):
+        if not self.pinned_frames or len(param.args) != 1:
+            return
+        parent, role, _ = self.pinned_frames[-1]
+        args = param.args[0]
+        if role == "open" and args is not None and args.getInt("chatMode") == PINNED_CHAT_MODE:
+            chat = param.thisObject
+            self.hide_mode.setBoolean(chat, self.hide_mode.getBoolean(parent))
+            self.watch_pinned_chat(chat)
+
+    def after_pinned_count(self, param):
+        chat = param.thisObject
+        if chat.getChatMode() == PINNED_CHAT_MODE:
+            source = self.pinned_ids.get(chat)
+            visible, _ = self.visible_pins(chat, source)
+            if visible.size() < source.size():
+                param.setResult(self.integer(visible.size()))
+
+    def after_pinned_mode_change(self, param):
+        chat = self.outer.get(param.thisObject)
+        for record in self.pinned_chats:
+            if record[0].get() == chat:
+                hiding = self.hide_mode.getBoolean(chat)
+                if hiding != record[1]:
+                    record[1] = hiding
+                    run_on_ui_thread(lambda: self.refresh_pinned_chat(chat), 1)
+                return
+
+    def refresh_pinned_chat(self, chat):
+        if not self.active or chat.getFragmentView() is None:
+            return
+        if chat.getChatMode() == 0:
+            chat.updateMessagesVisiblePart(False)
+            chat.updatePinnedMessageView(False)
+        elif chat.getChatMode() == PINNED_CHAT_MODE:
+            adapter = self.adapter.get(chat)
+            if adapter is not None:
+                adapter.notifyDataSetChanged(False)
+
+    def is_date(self, chat, msg):
+        return (msg is not None and msg.isDateObject and msg.type == self.message.TYPE_DATE
+                and not msg.isVideoConversionObject and msg != self.reply_header.get(chat))
+
+    def day_visible(self, adapter, messages, index, start):
+        return day_has_visible_message(
+            messages, index, messages.get(index).dateKeyInt,
+            lambda row: self.position_type(adapter, start + row) >= 0,
+        )
+
+    def after_view_type(self, param):
+        result = int(param.getResult())
+        if result == HIDDEN_ROW:
+            return
+        adapter, position = param.thisObject, int(param.args[0])
+        start = self.start.getInt(adapter)
+        if not start <= position < self.end.getInt(adapter):
+            return
+        chat = self.outer.get(adapter)
+        pinned = chat.getChatMode() == PINNED_CHAT_MODE
+        date_candidate = result == 1 and self.ayu.shouldHideFilteredMessages() and self.hide_mode.getBoolean(chat)
+        if not pinned and not date_candidate:
+            return
+        messages = adapter.getMessages()
+        index = position - start
+        if index >= messages.size():
+            return
+        msg = messages.get(index)
+        if pinned and self.pinned_hidden(chat, msg):
+            param.setResult(self.integer(HIDDEN_ROW))
+            return
+        if not date_candidate:
+            return
+        if not self.is_date(chat, msg):
+            return
+        visible = self.day_visible(adapter, messages, index, start)
+        if self.date_adapter is None or self.date_adapter.get() != adapter:
+            self.date_adapter = self.weak(adapter)
+            self.date_visibility = {}
+        self.date_visibility[int(msg.stableId)] = visible
+        if not visible:
+            param.setResult(self.integer(HIDDEN_ROW))
+
+    def after_chat_event(self, param):
+        event = int(param.args[0])
+        if event in self.pinned_events:
+            chat, payload = param.thisObject, param.args[2]
+            if len(payload) and int(payload[0]) == chat.getDialogId():
+                run_on_ui_thread(lambda: self.refresh_pinned_chat(chat), 1)
+        if (event not in self.date_events or self.date_refresh_pending
+                or self.date_adapter is None
+                or self.date_adapter.get() != self.adapter.get(param.thisObject)):
+            return
+        self.date_refresh_pending = True
+        run_on_ui_thread(self.refresh_dates, 1)
+
+    def refresh_dates(self):
+        self.date_refresh_pending = False
+        adapter = self.date_adapter.get() if self.active and self.date_adapter else None
+        if adapter is None:
+            return
+        chat = self.outer.get(adapter)
+        if not self.hide_mode.getBoolean(chat) or not self.ayu.shouldHideFilteredMessages():
+            return
+        messages = adapter.getMessages()
+        start = self.start.getInt(adapter)
+        observed = {}
+        for index in range(messages.size()):
+            msg = messages.get(index)
+            if msg is None or not msg.isDateObject:
+                continue
+            stable_id = int(msg.stableId)
+            if stable_id in self.date_visibility and self.is_date(chat, msg):
+                if self.position_type(adapter, start + index) != 1:
+                    continue
+                visible = self.day_visible(adapter, messages, index, start)
+                if visible != self.date_visibility[stable_id]:
+                    adapter.notifyItemChanged(start + index)
+                observed[stable_id] = visible
+        self.date_visibility = observed
+
+    def preview_key(self, cell):
+        if not cell.isDialogCell or cell.insideCommunityListNoDialog:
+            return None
+        account = self.account.getInt(cell)
+        if self.cell_message.get(cell) != self.dummies[account]:
+            return None
+        if cell.isDialogFolder() or cell.isDialogCommunity():
+            return None
+        dialog_id = int(cell.getDialogId())
+        controller = self.mc.getInstance(account)
+        dialog = controller.dialogs_dict.get(dialog_id)
+        if dialog is None or not dialog.top_message:
+            return None
+        if dialog.top_message < 0 and not self.dialog_object.isEncryptedDialog(dialog_id):
+            return None
+        top_group = controller.dialogMessage.get(dialog_id)
+        top = top_group.get(0) if top_group is not None and top_group.size() else None
+        edit_date = int(top.messageOwner.edit_date) if top is not None else 0
+        group_id = int(top.messageOwner.grouped_id) if top is not None else 0
+        return account, dialog_id, int(dialog.top_message), int(dialog.last_message_date), edit_date, group_id
+
+    def before_layout(self, param):
+        self.layouts.append(None)
+        cell = param.thisObject
+        key = self.preview_key(cell)
+        if key is None:
+            return
+        entry = self.cache.get(key)
+        if entry is None or (entry[0] <= monotonic() and key not in self.running):
+            self.schedule(cell, key)
+            return
+        self.cache.move_to_end(key)
+        candidate = entry[1]
+        if candidate is None:
+            return
+        message, group = candidate
+        if not self.allowed(message, group, key):
+            self.cache.pop(key, None)
+            self.schedule(cell, key)
+            return
+        self.track_cell(cell, key)
+        self.layouts[-1] = (cell, self.cell_message.get(cell), self.cell_group.get(cell),
+                            self.cell_date.getInt(cell))
+        self.cell_message.set(cell, message)
+        self.cell_group.set(cell, group.messages if group is not None else None)
+        self.cell_date.setInt(cell, message.messageOwner.date)
+
+    def after_layout(self, param):
+        saved = self.layouts.pop()
+        if saved is not None:
+            cell, message, group, date = saved
+            self.cell_message.set(cell, message)
+            self.cell_group.set(cell, group)
+            self.cell_date.setInt(cell, date)
+
+    def track_cell(self, cell, key):
+        self.cells[int(self.system.identityHashCode(cell))] = (self.weak(cell), key)
+
+    def after_cell_attach(self, param):
+        cell = param.thisObject
+        self.attached = {key: ref for key, ref in self.attached.items() if ref.get() is not None}
+        self.attached[int(self.system.identityHashCode(cell))] = self.weak(cell)
+        if self.preview_key(cell) is not None:
+            run_on_ui_thread(lambda: self.rebuild_cell(cell), 1)
+
+    def rebuild_cell(self, cell):
+        if self.active and cell.isAttachedToWindow():
+            cell.buildLayout()
+            cell.invalidate()
+
+    def schedule(self, cell, key):
+        self.track_cell(cell, key)
+        if key not in self.running and key not in self.queued:
+            self.queued[key] = None
+            run_on_ui_thread(self.drain_queue, 1)
+
+    def matching_cells(self, key=None):
+        for identity, (ref, previous) in list(self.cells.items()):
+            cell = ref.get()
+            if cell is None or self.preview_key(cell) != previous:
+                self.cells.pop(identity, None)
+            elif cell.isAttachedToWindow() and (key is None or key == previous):
+                yield cell
+
+    def drain_queue(self):
+        while self.active and self.queued and len(self.running) < 2:
+            key, _ = self.queued.popitem(last=False)
+            if not list(self.matching_cells(key)):
+                continue
+            lookup = PreviewSearch(self, key)
+            self.running[key] = lookup
+            lookup.next_page()
+
+    def allowed(self, message, group, key):
+        account, dialog_id = key[:2]
+        members = group.messages if group is not None else [message]
+        chat = self.mc.getInstance(account).getChat(-dialog_id) if dialog_id < 0 else None
+        block_enabled = self.ayu.shouldHideIgnoredBlockedMessages() and self.chat_object.isMegagroup(chat)
+        for i in range(members.size() if group is not None else 1):
+            member = members.get(i) if group is not None else members[i]
+            if (member.messageOwner.hide or member.isHiddenSensitive()
+                    or (block_enabled and self.ayu.isIgnoredBlockedMessage(member))):
+                return False
+        primary = group.findPrimaryMessageObject() if group is not None else None
+        return not self.ayu.shouldHideFilteredMessage(primary if primary is not None else message, group)
+
+    def clear_previews(self, *, rebind=False):
+        if not self.active:
+            return
+        self.cache.clear()
+        self.media_cached_lists.clear()
+        self.queued.clear()
+        running = list(self.running.values())
+        self.running.clear()
+        for lookup in running:
+            lookup.cancel()
+        if rebind:
+            for ref in list(self.attached.values()):
+                cell = ref.get()
+                if cell is not None and cell.isAttachedToWindow() and cell.isDialogCell:
+                    cell.update(0, False)
+                    self.rebuild_cell(cell)
+        else:
+            for cell in list(self.matching_cells()):
+                self.rebuild_cell(cell)
+
+    def after_filter_change(self, param):
+        def refresh():
+            self.clear_previews()
+            for ref, _ in self.pinned_chats[:]:
+                chat = ref.get()
+                if chat is not None:
+                    self.refresh_pinned_chat(chat)
+            for ref in self.media_layouts[:]:
+                layout = ref.get()
+                if layout is not None and layout.getParent() is not None:
+                    datasets = self.shared_data.get(layout)
+                    for kind, adapter_field in self.media_adapters.items():
+                        self.prune_loaded_media(layout, datasets[kind])
+                        adapter = adapter_field.get(layout)
+                        if adapter is not None:
+                            adapter.notifyDataSetChanged()
+                        self.continue_media_page(layout, kind)
+
+        run_on_ui_thread(refresh, 1)
+
+    def after_dialogs_event(self, param):
+        event = int(param.args[0])
+        if event in (self.filters_changed, self.messages_deleted):
+            run_on_ui_thread(lambda: self.clear_previews(rebind=event == self.filters_changed), 1)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for hook in self.hooks:
+            self.unhook_method(hook)
+
+        def restore():
+            for ref, _ in self.pinned_chats:
+                chat = ref.get()
+                if chat is not None and chat.getFragmentView() is not None and chat.getChatMode() == 0:
+                    chat.updateMessagesVisiblePart(False)
+                    chat.updatePinnedMessageView(False)
+            self.pinned_chats.clear()
+            for lookup in self.running.values():
+                lookup.cancel()
+            self.running.clear()
+            self.queued.clear()
+            self.cache.clear()
+            adapter = self.date_adapter.get() if self.date_adapter else None
+            if adapter is not None:
+                adapter.notifyDataSetChanged()
+            for ref, _ in self.cells.values():
+                cell = ref.get()
+                if cell is not None and cell.isAttachedToWindow():
+                    cell.buildLayout()
+                    cell.invalidate()
+            self.cells.clear()
+            self.attached.clear()
+
+        run_on_ui_thread(restore)
+
+
+class PreviewSearch:
+    def __init__(self, plugin, key):
+        self.plugin = plugin
+        self.key = key
+        self.account, self.dialog_id, self.top, _, _, self.top_group = key
+        self.controller = plugin.mc.getInstance(self.account)
+        self.connection = plugin.conn.getInstance(self.account)
+        self.offset = min(self.top + 1, 2147483647)
+        self.encrypted = bool(plugin.dialog_object.isEncryptedDialog(self.dialog_id))
+        self.local_offset = self.top - 1
+        self.pages = AlbumPages()
+        self.ticket = None
+        self.token = 0
+
+    def next_page(self):
+        p = self.plugin
+        if not p.active or p.running.get(self.key) is not self:
+            return
+        if self.encrypted:
+            self.next_secret_page()
+            return
+        request = p.history()
+        request.peer = self.controller.getInputPeer(self.dialog_id)
+        if request.peer is None:
+            self.finish(retry=True)
+            return
+        request.offset_id = self.offset
+        request.limit = PAGE_SIZE
+        ticket = self.ticket = object()
+        delegate = RequestCallback(
+            lambda result, error: run_on_ui_thread(lambda: self.receive(ticket, result, error)),
+            self.account,
+        )
+        self.token = self.connection.sendRequest(request, delegate)
+        run_on_ui_thread(lambda: self.timeout(ticket), 7000)
+
+    def next_secret_page(self):
+        # Secret chats have no getHistory endpoint. Use the host's local order and decoder.
+        p = self.plugin
+        ticket = self.ticket = object()
+        storage = p.storage.getInstance(self.account)
+        start = self.local_offset
+
+        def read():
+            ids = []
+            try:
+                cursor = storage.getDatabase().queryFinalized(
+                    f"SELECT mid FROM messages_v2 WHERE uid = {self.dialog_id} "
+                    f"AND mid > {start} AND mid < 0 ORDER BY mid ASC LIMIT {PAGE_SIZE}")
+                try:
+                    while cursor.next():
+                        ids.append(int(cursor.intValue(0)))
+                finally:
+                    cursor.dispose()
+                batch = [storage.getMessageLegit(self.dialog_id, mid) for mid in ids]
+                batch = [raw for raw in batch if raw is not None]
+                result = (batch, ids[-1] if ids else None)
+            except Exception:
+                result = None
+            run_on_ui_thread(lambda: self.receive_secret(ticket, result))
+
+        storage.getStorageQueue().postRunnable(R(read))
+        run_on_ui_thread(lambda: self.timeout(ticket), 7000)
+
+    def receive_secret(self, ticket, result):
+        p = self.plugin
+        if ticket is not self.ticket or not p.active:
+            return
+        self.ticket = None
+        if not list(p.matching_cells(self.key)):
+            self.finish(retain=False)
+        elif result is None:
+            self.finish(retry=True)
+        else:
+            batch, self.local_offset = result
+            end = self.local_offset is None
+            match = self.pages.consume(batch, self.choose, end=end)
+            if match is not None or end:
+                self.finish(match)
+            else:
+                run_on_ui_thread(self.next_page, 1)
+
+    def receive(self, ticket, response, error):
+        p = self.plugin
+        if ticket is not self.ticket or not p.active:
+            return
+        self.ticket, self.token = None, 0
+        if not list(p.matching_cells(self.key)):
+            self.finish(retain=False)
+            return
+        if error is not None or response is None or not hasattr(response, "messages"):
+            self.finish(retry=True)
+            return
+
+        self.controller.removeDeletedMessagesFromArray(self.dialog_id, response.messages)
+        items = {}
+        for index in range(response.messages.size()):
+            raw = response.messages.get(index)
+            if raw is not None and 0 < raw.id < self.offset and raw.id <= self.top:
+                items[int(raw.id)] = raw
+        if items:
+            self.controller.putUsers(response.users, True)
+            self.controller.putChats(response.chats, True)
+        ordered = [items[mid] for mid in sorted(items, reverse=True)]
+        candidate = self.pages.consume(ordered, self.choose, end=not ordered)
+        if candidate is not None or not ordered:
+            self.finish(candidate)
+        else:
+            self.offset = int(ordered[-1].id)
+            run_on_ui_thread(self.next_page, 1)
+
+    def choose(self, raw_messages):
+        p = self.plugin
+        if any(raw.id == self.top or (self.top_group and raw.grouped_id == self.top_group)
+               for raw in raw_messages):
+            return None
+        if any(raw.hide or p.empty_message.isInstance(raw) for raw in raw_messages):
+            return None
+        messages = []
+        for raw in raw_messages:
+            raw.dialog_id = self.dialog_id
+            messages.append(p.message(self.account, raw, False, False))
+        group = None
+        if raw_messages[0].grouped_id:
+            group = p.album()
+            group.groupId = raw_messages[0].grouped_id
+            for message in messages:
+                group.messages.add(message)
+            group.calculate()
+        if p.allowed(messages[0], group, self.key):
+            return messages[0], group
+        return None
+
+    def timeout(self, ticket):
+        if ticket is self.ticket:
+            self.cancel()
+            self.finish(retry=True)
+
+    def cancel(self):
+        self.ticket = None
+        if self.token:
+            self.connection.cancelRequest(self.token, True)
+            self.token = 0
+
+    def finish(self, candidate=None, *, retry=False, retain=True):
+        p = self.plugin
+        if p.running.get(self.key) is not self:
+            return
+        del p.running[self.key]
+        if retain:
+            p.cache[self.key] = (monotonic() + (8 if retry else 180), candidate)
+            p.cache.move_to_end(self.key)
+            while len(p.cache) > 96:
+                p.cache.popitem(last=False)
+        if candidate is not None:
+            for cell in list(p.matching_cells(self.key)):
+                p.rebuild_cell(cell)
+        run_on_ui_thread(p.drain_queue, 1)

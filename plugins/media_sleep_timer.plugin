@@ -1,0 +1,1023 @@
+from android_utils import OnClickListener, R, run_on_ui_thread
+from base_plugin import BasePlugin
+from java import dynamic_proxy, jarray, jclass, jint
+
+
+__id__ = "media_sleep_timer"
+__name__ = "媒体播放定时停止"
+__description__ = "音乐工具栏提供独立定时入口，倍速控件避开进度条；视频也支持定时。"
+__author__ = "Codex"
+__version__ = "1.0.10"
+__app_version__ = ">=12.10.1"
+
+PRESETS = (15, 30, 45, 60, 90, 120)
+MENU_ID = 65347
+VIDEO_TIMER_CONTROL_TAG = "nagramxf_media_suite.video_timer"
+STATE_ENDED = 4
+WHITE = -1
+VIDEO_SHEET_COLOR = 0xFF1C2229 - (1 << 32)
+VIDEO_TIMER_BLUE = 0xFF62AFF5 - (1 << 32)
+AUDIO_TIMER_BLUE = 0xFF216BC2 - (1 << 32)
+AUDIO_ROW_HEIGHT = 48
+
+
+def resolve_method(owner, name, arity):
+    result, = (m for m in owner.getDeclaredMethods()
+               if m.getName() == name and len(m.getParameterTypes()) == arity)
+    result.setAccessible(True)
+    return result
+
+
+def resolve_field(owner, name):
+    result = owner.getDeclaredField(name)
+    result.setAccessible(True)
+    return result
+
+
+def duration_minutes(selection, custom):
+    if 0 <= selection < len(PRESETS):
+        return PRESETS[selection]
+    try:
+        minutes = int(custom)
+    except ValueError:
+        return None
+    return minutes if 1 <= minutes <= 1440 else None
+
+
+def format_timer_time(seconds):
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:02d}:{seconds:02d}"
+
+
+def audio_slots(width, padding, count):
+    usable = max(0, width - 2 * padding)
+    edges = [padding + usable * index // count for index in range(count + 1)]
+    return list(zip(edges, edges[1:]))
+
+
+def centered_audio_slots(width, padding, left_count, right_count):
+    available = max(0, width - 2 * padding)
+    slot = available // (2 * max(1, left_count, right_count) + 1)
+    start = (width - slot) // 2
+    center = (start, start + slot)
+    left = [(padding + first, padding + last)
+            for first, last in audio_slots(start - padding, 0, left_count)] if left_count else []
+    right = [(center[1] + first, center[1] + last)
+             for first, last in audio_slots(width - padding - center[1], 0, right_count)] if right_count else []
+    return [*left, center, *right]
+
+
+class MediaSleepTimer(BasePlugin):
+    def on_plugin_load(self):
+        self.active = True
+        self.session = None
+        self.waiting = None
+        self.last_minutes = 60
+        self.last_finish = False
+        self.menus = []
+        self.audio_rows = []
+        self.dialog = None
+        self.dialog_is_sheet = False
+        self.editor_dialog = None
+        self.dialog_viewer = None
+        self.dialog_generation = 0
+        self.hooks = []
+        self.weak = jclass("java.lang.ref.WeakReference")
+        self.clock = jclass("android.os.SystemClock")
+        self.handler = jclass("android.os.Handler")(jclass("android.os.Looper").getMainLooper())
+        self.tick_runnable = R(self.run_tick)
+        self.countdown_runnable = R(self.run_countdown)
+        controller = jclass("org.telegram.messenger.MediaController")
+        self.controller = controller.getInstance()
+        self.audio_player = resolve_field(controller.getClass(), "audioPlayer")
+        viewer = jclass("org.telegram.ui.PhotoViewer").getClass()
+        video_player = jclass("org.telegram.ui.Components.VideoPlayer").getClass()
+        audio_ui = jclass("org.telegram.ui.Components.AudioPlayerAlert").getClass()
+        menu = jclass("org.telegram.ui.ActionBar.ActionBarMenuItem").getClass()
+        self.video_menu = resolve_field(viewer, "videoItem")
+        self.loop_item = resolve_field(viewer, "loopItem")
+        self.viewer_window = resolve_field(viewer, "windowView")
+        self.current_index = resolve_field(viewer, "currentIndex")
+        self.manually_paused = resolve_field(viewer, "manuallyPaused")
+        self.native_alert = jclass("org.telegram.ui.ActionBar.AlertDialog$Builder")
+        self.dialog_option_listener = jclass("android.content.DialogInterface$OnClickListener")
+        self.timer_labels = jarray(jclass("java.lang.CharSequence"))
+        self.timer_layout = jclass("android.widget.LinearLayout")
+        self.layout_helper = jclass("org.telegram.ui.Components.LayoutHelper")
+        self.toast = jclass("android.widget.Toast")
+        drawables = jclass("org.telegram.messenger.R$drawable")
+        self.clock_icon = drawables.msg_timer
+        self.track_icons = (drawables.baseline_skip_previous_24_white, drawables.baseline_skip_next_24_white)
+        self.audio_native_buttons = resolve_field(audio_ui, "buttons")
+        self.audio_layout = resolve_field(audio_ui, "playerLayout")
+        self.audio_speed = resolve_field(audio_ui, "playbackSpeedButton")
+        self.audio_title_color = resolve_field(audio_ui, "forwardButton")
+        self.audio_profile_add = resolve_field(audio_ui, "saveToProfileButton")
+        self.audio_profile_remove = resolve_field(audio_ui, "unsaveFromProfileButton")
+        self.audio_shadow = resolve_field(audio_ui, "playerShadow")
+        self.audio_list = resolve_field(audio_ui, "listView")
+        self.audio_noforwards = resolve_field(audio_ui, "noforwards")
+        self.audio_my_list = resolve_method(audio_ui, "isMyList", 0)
+        self.audio_update_title = resolve_method(audio_ui, "updateTitle", 1)
+        self.object_args = jarray(jclass("java.lang.Object"))
+        self.boolean = jclass("java.lang.Boolean")
+        self.image_view = jclass("android.widget.ImageView")
+        self.text_view = jclass("android.widget.TextView")
+        self.frame_layout = jclass("android.widget.FrameLayout")
+        self.measure_spec = jclass("android.view.View$MeasureSpec")
+        self.sdk = int(jclass("android.os.Build$VERSION").SDK_INT)
+        self.center = jclass("android.widget.ImageView$ScaleType").CENTER
+        self.frame_params = jclass("android.widget.FrameLayout$LayoutParams")
+        self.linear_params = jclass("android.widget.LinearLayout$LayoutParams")
+        self.round_rect = jclass("android.graphics.drawable.GradientDrawable")
+        self.layout_listener = jclass("android.view.View$OnLayoutChangeListener")
+        self.theme = jclass("org.telegram.ui.ActionBar.Theme")
+        self.dp = jclass("org.telegram.messenger.AndroidUtilities").dp
+        self.bind(viewer, "setParentActivity", 3, after=self.after_viewer_setup)
+        for name, arity in (("closePhoto", 2), ("onPause", 0), ("onHideView", 0),
+                            ("onUserLeaveHint", 0),
+                            ("pipHidePrimaryWindowView", 1), ("switchToPip", 1),
+                            ("destroyPhotoViewer", 0)):
+            self.bind(viewer, name, arity, before=lambda param: self.dismiss_timer_ui(param.thisObject))
+        launch = jclass("org.telegram.ui.LaunchActivity").getClass()
+        self.bind(launch, "onPause", 0, before=self.before_launch_transition)
+        self.bind(launch, "onNewIntent", 2, before=self.before_launch_transition)
+        self.bind(menu, "toggleSubMenu", 3, before=self.before_submenu)
+        self.hooks.extend(self.hook_all_constructors(audio_ui, after=self.install_audio_bar))
+        self.bind(audio_ui, "updateColors", 0, after=self.after_audio_colors)
+        self.bind(audio_ui, "updateTitle", 1, after=self.after_audio_title)
+        self.bind(audio_ui, "setVisibleInProfile", 1, before=self.before_audio_profile)
+        self.bind(video_player, "maybeReportPlayerState", 0,
+                  before=self.before_player_state, after=self.after_player_state)
+        self.bind(video_player, "onPositionDiscontinuity", 3, before=self.before_repeat)
+        def install_existing():
+            if not self.active:
+                return
+            for name in ("Instance", "Instance2", "PipInstance"):
+                existing = resolve_field(viewer, name).get(None)
+                if existing is not None:
+                    self.install_video_menu(existing)
+
+        run_on_ui_thread(install_existing)
+
+    def bind(self, owner, name, arity, **callbacks):
+        self.hooks.append(self.hook_method(resolve_method(owner, name, arity), **callbacks))
+
+    def option(self, key):
+        return getattr(self, "flags", {}).get(key, True)
+
+    def after_viewer_setup(self, param):
+        if self.active:
+            self.install_video_menu(param.thisObject)
+
+    def install_video_menu(self, viewer):
+        if not self.option("timer"):
+            return
+        menu = self.video_menu.get(viewer)
+        if menu is None:
+            return
+        self.menus = [entry for entry in self.menus if entry[0].get() is not None]
+        if any(entry[0].get() == menu for entry in self.menus):
+            return
+        row = menu.addSubItem(MENU_ID, self.clock_icon, "定时停止")
+        row.setColors(WHITE, WHITE)
+        row.setSelectorColor(0x0FFFFFFF)
+        parent = row.getParent()
+        loop = self.loop_item.get(viewer)
+        if parent is not None and loop is not None and loop.getParent() == parent:
+            params = row.getLayoutParams()
+            parent.removeView(row)
+            parent.addView(row, parent.indexOfChild(loop) + 1, params)
+        viewer_ref = self.weak(viewer)
+
+        def open_timer(view):
+            menu.closeSubMenu()
+            current = viewer_ref.get()
+            if self.active and current is not None:
+                anchor = self.viewer_window.get(current)
+                if anchor is not None:
+                    self.open_video_timer(anchor, viewer_ref)
+
+        row.setOnClickListener(self.timer_click(open_timer))
+        self.menus.append((self.weak(menu), self.weak(row), viewer_ref))
+        self.render_video_timer(row, viewer, self.timer_label(viewer))
+
+    def before_submenu(self, param):
+        if not self.active:
+            return
+        for menu_ref, row_ref, viewer_ref in self.menus:
+            if menu_ref.get() != param.thisObject:
+                continue
+            row, viewer = row_ref.get(), viewer_ref.get()
+            if row is not None:
+                if viewer is not None:
+                    self.render_video_timer(row, viewer, self.timer_label(viewer))
+                player = viewer.getVideoPlayer() if viewer is not None else None
+                row.setVisibility(0 if player is not None else 8)
+            break
+
+    def install_audio_bar(self, param):
+        audio = param.thisObject
+        player_layout = self.audio_layout.get(audio)
+        native = self.audio_native_buttons.get(audio)
+        if not self.active or player_layout is None or native is None or len(native) != 7 or native[6] is None:
+            return
+        toolbar = native[6].getParent()
+        if toolbar is None:
+            return
+        self.audio_rows = [row for row in self.audio_rows if row[0].get() is not None]
+        if any(row[0].get() == audio for row in self.audio_rows):
+            return
+
+        context = toolbar.getContext()
+        timer = self.frame_layout(context)
+        icon = self.image_view(context)
+        icon.setImageResource(self.clock_icon)
+        icon.setScaleType(self.center)
+        timer.addView(icon, self.frame_params(-1, -1, 17))
+        timer.setContentDescription("定时停止")
+        timer.setOnClickListener(OnClickListener(lambda view: self.show_timer(view, None)))
+        toolbar.addView(timer, self.frame_params(self.dp(48), self.dp(48)))
+        audio_ref, timer_ref = self.weak(audio), self.weak(timer)
+        plugin = self
+
+        class LayoutListener(dynamic_proxy(self.layout_listener)):
+            def onLayoutChange(self, view, left, top, right, bottom, old_left, old_top, old_right, old_bottom):
+                audio, timer = audio_ref.get(), timer_ref.get()
+                if plugin.active and audio is not None and timer is not None:
+                    plugin.update_audio_footer(audio)
+                    plugin.layout_audio_buttons(audio, timer)
+
+        listener = LayoutListener()
+        player_layout.addOnLayoutChangeListener(listener)
+        self.audio_rows.append((audio_ref, timer_ref, listener))
+        self.color_audio_clock(audio, timer)
+        self.update_audio_footer(audio)
+
+    def layout_audio_buttons(self, audio, timer):
+        native = self.audio_native_buttons.get(audio)
+        toolbar = timer.getParent()
+        speed = self.audio_speed.get(audio)
+        use_timer = self.option("timer")
+        move_speed = self.option("audio_toolbar")
+        timer.setVisibility(0 if use_timer else 8)
+        if toolbar is None:
+            return
+        self.style_audio_track_icons(audio, toolbar, restore=not (use_timer or move_speed))
+        if not (use_timer or move_speed) or toolbar.getWidth() <= 0:
+            return
+        def visible(buttons):
+            return [button for button in buttons if button is not None
+                    and button.getParent() is not None and button.getVisibility() == 0]
+
+        native_playback = tuple(native[index] for index in range(1, 6))
+        playback = visible(native_playback)
+        tools = visible((native[0], speed if move_speed else None, timer, native[6]))
+        play = native[3]
+        if play not in playback:
+            return
+        row_width = min(toolbar.getWidth(), self.dp(420))
+        inset = (toolbar.getWidth() - row_width) // 2
+        padding = self.dp(14)
+        if not move_speed:
+            playback = visible((native[0], *native_playback, timer, native[6]))
+        play_index = playback.index(play)
+        slots = centered_audio_slots(row_width, padding, play_index, len(playback) - play_index - 1)
+        self.layout_audio_line(playback, slots, inset, self.dp(29), native, speed, toolbar)
+        if move_speed and tools:
+            self.layout_audio_line(tools, audio_slots(row_width, padding, len(tools)),
+                                   inset, self.dp(29 + AUDIO_ROW_HEIGHT), native, speed, toolbar)
+
+    def layout_audio_line(self, buttons, slots, inset, center_y, native, speed, toolbar):
+        for button, (left, right) in zip(buttons, slots):
+            params = button.getLayoutParams()
+            available = right - left
+            width = min(params.width, available) if params.width >= 0 else available
+            height = params.height if params.height >= 0 else button.getMeasuredHeight()
+            if button in (native[1], native[5]):
+                # Keep the native seek labels legible even when all nine buttons are present.
+                padding = min(self.dp(8), max(self.dp(2), (available - self.dp(27)) // 2))
+                if button.getPaddingLeft() != padding:
+                    button.setPadding(padding, 0, padding, 0)
+            mode = self.measure_spec.EXACTLY if params.width >= 0 else self.measure_spec.AT_MOST
+            button.measure(self.measure_spec.makeMeasureSpec(width, mode),
+                           self.measure_spec.makeMeasureSpec(height, self.measure_spec.EXACTLY))
+            width = button.getMeasuredWidth()
+            x = inset + left + (right - left - width) // 2
+            y = center_y - height // 2
+            if button == speed:
+                x += toolbar.getLeft()
+                y += toolbar.getTop()
+            button.layout(x, y, x + width, y + height)
+
+    def before_audio_profile(self, param):
+        if self.active and self.option("hide_audio_profile_button"):
+            self.update_audio_footer(param.thisObject)
+            param.setResult(None)
+
+    def after_audio_title(self, param):
+        audio = param.thisObject
+        self.update_audio_footer(audio)
+        layout = self.audio_layout.get(audio)
+        if layout is not None:
+            layout.requestLayout()
+
+    def update_audio_footer(self, audio, restore=False):
+        layout, shadow = self.audio_layout.get(audio), self.audio_shadow.get(audio)
+        if layout is None or shadow is None:
+            return
+        separate_rows = self.active and self.option("audio_toolbar")
+        extra_height = AUDIO_ROW_HEIGHT if separate_rows else 0
+        hide = self.option("hide_audio_profile_button") and not restore
+        if hide:
+            height = self.dp(179)
+            for profile in (self.audio_profile_add, self.audio_profile_remove):
+                button = profile.get(audio)
+                if button is not None:
+                    button.animate().cancel()
+                    button.setVisibility(8)
+        else:
+            extra = not self.audio_noforwards.getBoolean(audio) and not self.audio_my_list.invoke(audio, self.object_args([]))
+            height = self.dp(179 + (52 if extra else 0))
+        height += self.dp(extra_height)
+        native = self.audio_native_buttons.get(audio)
+        toolbar = native[6].getParent() if native is not None and native[6] is not None else None
+        if toolbar is not None:
+            params = toolbar.getLayoutParams()
+            target = self.dp(66 + extra_height)
+            if params is not None and params.height != target:
+                params.height = target
+                toolbar.setLayoutParams(params)
+        params = layout.getLayoutParams()
+        if params is not None and params.height != height:
+            params.height = height
+            layout.setLayoutParams(params)
+        params = shadow.getLayoutParams()
+        if params is not None and params.bottomMargin != height:
+            params.bottomMargin = height
+            shadow.setLayoutParams(params)
+        playlist = self.audio_list.get(audio)
+        if playlist is not None and playlist.getPaddingBottom() > 0:
+            padding = self.dp(179 + 52 + extra_height)
+            if playlist.getPaddingBottom() != padding:
+                playlist.setPadding(playlist.getPaddingLeft(), playlist.getPaddingTop(),
+                                    playlist.getPaddingRight(), padding)
+        if restore and layout.isAttachedToWindow():
+            self.audio_update_title.invoke(audio, self.object_args([self.boolean(False)]))
+
+    def color_audio_clock(self, audio, timer):
+        color = self.audio_title_color.get(audio).getCurrentTextColor()
+        timer.setBackground(self.theme.createSelectorDrawable(color & 0x19FFFFFF, 1, self.dp(18)))
+        self.render_timer_control(timer, color, self.audio_timer_blue(), self.timer_label(None))
+
+    def style_audio_track_icons(self, audio, toolbar, *, restore):
+        if toolbar is None:
+            return
+        native = self.audio_native_buttons.get(audio)
+        color = self.audio_title_color.get(audio).getCurrentTextColor()
+        for index, resource in zip((2, 4), self.track_icons):
+            button = native[index]
+            if button is None or button.getParent() != toolbar:
+                continue
+            animated = button.getAnimatedDrawable()
+            if restore:
+                if button.getDrawable() != animated:
+                    button.setImageDrawable(animated)
+                    button.setRotation(0.0 if index == 2 else 180.0)
+                    button.clearColorFilter()
+            else:
+                if button.getDrawable() == animated:
+                    button.setImageResource(resource)
+                    button.setRotation(0.0)
+                button.setColorFilter(color)
+        if restore:
+            padding = self.dp(8)
+            for index in (1, 5):
+                button = native[index]
+                if button is not None and button.getPaddingLeft() != padding:
+                    button.setPadding(padding, 0, padding, 0)
+
+    def after_audio_colors(self, param):
+        for audio_ref, timer_ref, _ in self.audio_rows:
+            timer = timer_ref.get()
+            if timer is not None and audio_ref.get() == param.thisObject:
+                self.color_audio_clock(param.thisObject, timer)
+                self.style_audio_track_icons(param.thisObject, timer.getParent(),
+                                             restore=not (self.option("timer") or self.option("audio_toolbar")))
+
+    def audio_timer_blue(self):
+        return VIDEO_TIMER_BLUE if self.theme.isCurrentThemeDark() else AUDIO_TIMER_BLUE
+
+    def render_timer_control(self, button, normal, blue, label):
+        icon = button.getChildAt(0)
+        if button.getChildCount() == 1 and label:
+            text = self.text_view(button.getContext())
+            text.setGravity(17)
+            text.setMaxLines(1)
+            text.setIncludeFontPadding(False)
+            text.setTextSize(11.0)
+            if self.sdk >= 26:
+                text.setAutoSizeTextTypeUniformWithConfiguration(8, 11, 1, 2)
+            text.setImportantForAccessibility(2)
+            params = self.frame_params(-1, self.dp(14), 81)
+            params.bottomMargin = self.dp(1)
+            button.addView(text, params)
+        text = button.getChildAt(1)
+        if text is not None:
+            text.setTextColor(blue)
+            if str(text.getText()) != label:
+                text.setText(label)
+            if text.getVisibility() != (0 if label else 4):
+                text.setVisibility(0 if label else 4)
+        icon.setColorFilter(blue if label else normal)
+        icon.setTranslationY(float(-self.dp(6) if label else 0))
+        button.setContentDescription(f"定时停止，剩余 {label}" if label else "定时停止")
+
+    def render_video_timer(self, item, viewer, label):
+        color = VIDEO_TIMER_BLUE if label else WHITE
+        item.setColors(color, color)
+        title = f"定时停止  {label}" if label else "定时停止"
+        if str(item.getTextView().getText()) != title:
+            item.setText(title)
+        window = self.viewer_window.get(viewer)
+        if window is not None:
+            for tag in (VIDEO_TIMER_CONTROL_TAG, VIDEO_TIMER_CONTROL_TAG + ".compact"):
+                button = window.findViewWithTag(tag)
+                if button is not None:
+                    self.render_timer_control(button, WHITE, VIDEO_TIMER_BLUE, label)
+
+    def timer_label(self, viewer):
+        if self.session is None:
+            return ""
+        target = self.session[2]
+        if (target is None) != (viewer is None) or (target is not None and target.get() != viewer):
+            return ""
+        return ("+" if self.waiting is not None else "") + format_timer_time(self.timer_seconds())
+
+    def update_countdown(self):
+        for _, item_ref, viewer_ref in self.menus:
+            item, viewer = item_ref.get(), viewer_ref.get()
+            if item is not None and viewer is not None:
+                self.render_video_timer(item, viewer, self.timer_label(viewer))
+        audio_label = self.timer_label(None)
+        for audio_ref, timer_ref, _ in self.audio_rows:
+            audio, timer = audio_ref.get(), timer_ref.get()
+            if audio is not None and timer is not None:
+                color = self.audio_title_color.get(audio).getCurrentTextColor()
+                self.render_timer_control(timer, color, self.audio_timer_blue(), audio_label)
+
+    def run_countdown(self):
+        try:
+            self.update_countdown()
+        except Exception as error:
+            self.log(f"Timer countdown failed: {type(error).__name__}: {error}")
+        if self.active and self.session is not None:
+            self.handler.postDelayed(self.countdown_runnable, 1000)
+
+    def request_countdown(self):
+        self.handler.removeCallbacks(self.countdown_runnable)
+        self.handler.post(self.countdown_runnable)
+
+    def timer_context(self, anchor, viewer_ref):
+        viewer = viewer_ref.get() if viewer_ref is not None else None
+        activity = viewer.getParentActivity() if viewer is not None else None
+        return activity if activity is not None else anchor.getContext()
+
+    def timer_provider(self, viewer_ref):
+        if viewer_ref is None:
+            return None
+        try:
+            return jclass("org.telegram.ui.Stories.DarkThemeResourceProvider")()
+        except Exception:
+            return None
+
+    def open_video_timer(self, anchor, viewer_ref):
+        self.dismiss_timer_ui()
+        self.dialog_viewer = viewer_ref
+        generation = self.dialog_generation
+        self.run_timer_dialog_step(generation, lambda: self.show_timer(anchor, viewer_ref), 1)
+
+    def run_timer_dialog_step(self, generation, callback, delay):
+        def run():
+            if generation == self.dialog_generation:
+                self.try_timer_action(callback)
+
+        run_on_ui_thread(run, delay)
+
+    def before_launch_transition(self, param):
+        viewer = self.dialog_viewer.get() if self.dialog_viewer is not None else None
+        if viewer is not None and viewer.getParentActivity() == param.thisObject:
+            self.dismiss_timer_ui(viewer)
+
+    def dismiss_timer_ui(self, viewer=None):
+        owner = self.dialog_viewer
+        if viewer is not None and (owner is None or owner.get() != viewer):
+            return
+        self.dialog_generation += 1
+        dialogs = ((self.editor_dialog, False), (self.dialog, self.dialog_is_sheet))
+        self.editor_dialog = self.dialog = self.dialog_viewer = None
+        self.dialog_is_sheet = False
+        for reference, is_sheet in dialogs:
+            dialog = reference.get() if reference is not None else None
+            if dialog is not None and dialog.isShowing():
+                try:
+                    if is_sheet:
+                        dialog.skipDismissAnimation()
+                    dialog.dismiss()
+                except Exception as error:
+                    self.log(f"Could not dismiss timer dialog: {type(error).__name__}")
+
+    def show_timer(self, anchor, viewer_ref):
+        viewer = viewer_ref.get() if viewer_ref is not None else None
+        if (not self.active or not self.option("timer") or not anchor.isAttachedToWindow()
+                or (viewer_ref is not None and (viewer is None or not viewer.isVisible()))):
+            return
+        try:
+            self.dismiss_timer_ui()
+            self.dialog_viewer = viewer_ref
+            self.show_timer_panel(anchor, viewer_ref)
+        except Exception as error:
+            self.log(f"Could not open native timer sheet: {type(error).__name__}: {error}")
+            try:
+                self.show_timer_fallback(anchor, viewer_ref)
+            except Exception as fallback_error:
+                self.log(f"Could not open native timer options: {type(fallback_error).__name__}: {fallback_error}")
+                self.toast.makeText(anchor.getContext(), "无法打开睡眠定时", 0).show()
+
+    def timer_click(self, callback):
+        def invoke(view):
+            self.try_timer_action(lambda: callback(view))
+
+        return OnClickListener(invoke)
+
+    def try_timer_action(self, callback):
+        try:
+            if self.active:
+                callback()
+        except Exception as error:
+            self.log(f"Timer action failed: {type(error).__name__}: {error}")
+
+    def timer_seconds(self):
+        if self.waiting is not None:
+            player = self.waiting[0]
+            engine = player.player
+            speed = float(engine.getPlaybackParameters().speed) if engine is not None else 1.0
+            return int(max(0, player.getDuration() - player.getCurrentPosition())
+                       / max(0.1, speed) / 1000)
+        return max(0, (self.session[0] - self.clock.elapsedRealtime() + 999) // 1000)
+
+    def timer_status(self):
+        if self.waiting is not None:
+            return f"等待播完 +{format_timer_time(self.timer_seconds())}"
+        if self.session is not None:
+            return f"剩余 {format_timer_time(self.timer_seconds())}"
+        return ""
+
+    def timer_color(self, key, provider):
+        return self.theme.getColor(key, provider) if provider is not None else self.theme.getColor(key)
+
+    def make_video_presets(self, context, provider, select):
+        row = self.timer_layout(context)
+        row.setOrientation(0)
+        chips = []
+        for minutes in PRESETS:
+            chip = self.text_view(context)
+            chip.setText(str(minutes))
+            chip.setTextSize(12)
+            chip.setGravity(17)
+            chip.setContentDescription(f"{minutes} 分钟")
+            chip.setOnClickListener(self.timer_click(lambda view, value=minutes: select(value)))
+            params = self.linear_params(0, -1, 1.0)
+            params.leftMargin = params.rightMargin = self.dp(2)
+            row.addView(chip, params)
+            chips.append((minutes, chip))
+
+        def mark(selected):
+            normal = self.timer_color(self.theme.key_dialogTextBlack, provider)
+            for minutes, chip in chips:
+                checked = minutes == selected
+                background = self.round_rect()
+                background.setCornerRadius(float(self.dp(14)))
+                background.setColor(0x3262AFF5 if checked else 0x14FFFFFF)
+                chip.setBackground(background)
+                chip.setTextColor(VIDEO_TIMER_BLUE if checked else normal)
+                chip.setSelected(checked)
+
+        return row, mark
+
+    def show_timer_panel(self, anchor, viewer_ref):
+        context = self.timer_context(anchor, viewer_ref)
+        provider = self.timer_provider(viewer_ref)
+        native_sheet = jclass("org.telegram.ui.ActionBar.BottomSheet$Builder")
+        timer_setting = jclass("org.telegram.ui.Cells.TextSettingsCell")
+        timer_check = jclass("org.telegram.ui.Cells.TextCheckCell")
+        timer_slider = jclass("org.telegram.ui.Components.SlideChooseView")
+        slider_callback = jclass("org.telegram.ui.Components.SlideChooseView$Callback")
+        timer_button = jclass("org.telegram.ui.Stories.recorder.ButtonWithCounterView")
+        timer_strings = jarray(jclass("java.lang.String"))
+        root = self.timer_layout(context)
+        root.setOrientation(1)
+        compact = viewer_ref is not None
+        chosen = self.last_minutes
+        custom = chosen if chosen not in PRESETS else None
+        initial_finish = self.last_finish
+
+        def add(view, height, sides=0, top=0, bottom=0):
+            root.addView(view, self.layout_helper.createLinear(
+                jint(-1), jint(height), jint(51), jint(sides), jint(top), jint(sides), jint(bottom)))
+
+        duration = timer_setting(context, provider)
+        duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
+        duration.setBackground(self.theme.createSelectorDrawable(
+            self.theme.getColor(self.theme.key_listSelector), 1))
+        add(duration, 48)
+
+        slider = None
+        mark = None
+
+        def repaint_slider():
+            if mark is not None:
+                mark(chosen)
+            else:
+                labels = [str(value) for value in PRESETS]
+                if custom is not None:
+                    labels.append("自定义")
+                selection = PRESETS.index(chosen) if chosen in PRESETS else len(PRESETS)
+                slider.setOptions(selection, timer_strings(labels))
+            duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
+
+        def select(minutes):
+            nonlocal chosen
+            chosen = minutes
+            repaint_slider()
+
+        class SliderCallback(dynamic_proxy(slider_callback)):
+            def onOptionSelected(self, index):
+                nonlocal chosen
+                if 0 <= index < len(PRESETS):
+                    chosen = PRESETS[index]
+                elif index == len(PRESETS) and custom is not None:
+                    chosen = custom
+                else:
+                    return
+                duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
+
+            def onTouchEnd(self):
+                pass
+
+        if compact:
+            presets, mark = self.make_video_presets(context, provider, select)
+            add(presets, 38, 14, 0, 2)
+        else:
+            slider = timer_slider(context, provider)
+            slider.setCallback(SliderCallback())
+            slider.setContentDescription("睡眠定时时长")
+            add(slider, 72)
+        repaint_slider()
+
+        finish = timer_check(context, provider)
+        if compact:
+            finish.setHeight(42)
+        finish.setTextAndCheck("播完当前媒体再停止", initial_finish, not compact)
+        finish.setOnClickListener(self.timer_click(lambda view: finish.setChecked(not finish.isChecked())))
+        add(finish, 42 if compact else 48)
+
+        if compact:
+            status = self.text_view(context)
+            status.setTextSize(13)
+            status.setGravity(19)
+            status.setTextColor(self.timer_color(self.theme.key_dialogTextGray2, provider))
+            add(status, 26, 18)
+        else:
+            status = timer_setting(context, provider)
+            add(status, 42)
+
+        def update_status():
+            if compact:
+                status.setText(f"当前定时 · {self.timer_status()}")
+            else:
+                status.setTextAndValue("当前定时", self.timer_status(), False)
+
+        update_status()
+        status.setVisibility(0 if self.session is not None else 8)
+
+        start = timer_button(context, provider).setRound()
+        start.setText("重新定时" if self.session is not None else "开始定时")
+        cancel = timer_button(context, provider).setRound().setNeutral()
+        cancel.setText("取消定时")
+        cancel.setVisibility(0 if self.session is not None else 8)
+        if compact:
+            actions = self.timer_layout(context)
+            actions.setOrientation(0)
+            cancel_params = self.linear_params(0, -1, 1.0)
+            cancel_params.rightMargin = self.dp(8)
+            actions.addView(cancel, cancel_params)
+            actions.addView(start, self.linear_params(0, -1, 1.0))
+            add(actions, 42, 16, 6, 8)
+        else:
+            add(start, 48, 16, 12, 12)
+            add(cancel, 42, 16, 0, 12)
+
+        def use_custom(minutes):
+            nonlocal chosen, custom
+            chosen = minutes
+            custom = minutes if minutes not in PRESETS else None
+            repaint_slider()
+
+        duration.setOnClickListener(self.timer_click(
+            lambda view: self.edit_timer_minutes(anchor, viewer_ref, chosen, use_custom)))
+        builder = (native_sheet(context, False, provider, VIDEO_SHEET_COLOR)
+                   if provider is not None else native_sheet(context))
+        builder.setTitle("睡眠定时")
+        builder.setCustomView(root)
+        sheet = builder.create()
+        sheet.scrollNavBar = True
+        sheet.show()
+        if not sheet.isShowing():
+            raise RuntimeError("Nagram did not show the bottom sheet")
+        self.dialog = self.weak(sheet)
+        self.dialog_is_sheet = True
+
+        def begin(view):
+            if self.active:
+                self.start_timer(chosen, bool(finish.isChecked()), viewer_ref)
+            sheet.dismiss()
+
+        def stop_timer(view):
+            self.clear()
+            sheet.dismiss()
+
+        start.setOnClickListener(self.timer_click(begin))
+        cancel.setOnClickListener(self.timer_click(stop_timer))
+
+        def refresh():
+            try:
+                if not self.active or not sheet.isShowing():
+                    return
+                is_running = self.session is not None
+                status.setVisibility(0 if is_running else 8)
+                cancel.setVisibility(0 if is_running else 8)
+                update_status()
+                start.setText("重新定时" if is_running else "开始定时")
+                if is_running:
+                    run_on_ui_thread(refresh, 1000)
+            except Exception as error:
+                self.log(f"Timer status update failed: {type(error).__name__}")
+
+        if self.session is not None:
+            run_on_ui_thread(refresh, 1000)
+
+    def native_timer_alert(self, context, viewer_ref):
+        provider = self.timer_provider(viewer_ref)
+        return self.native_alert(context, provider) if provider is not None else self.native_alert(context)
+
+    def show_native_timer_alert(self, builder, viewer_ref):
+        dialog = builder.create()
+        viewer = viewer_ref.get() if viewer_ref is not None else None
+        if viewer is not None:
+            viewer.showAlertDialog(builder)
+        else:
+            dialog.show()
+        if not dialog.isShowing():
+            raise RuntimeError("Nagram did not show the alert")
+        return dialog
+
+    def edit_timer_minutes(self, anchor, viewer_ref, selected, accept):
+        context = self.timer_context(anchor, viewer_ref)
+        layout = self.timer_layout(context)
+        layout.setOrientation(1)
+        edit = jclass("org.telegram.ui.Components.EditTextBoldCursor")(context)
+        edit.setInputType(2)
+        edit.setSingleLine(True)
+        edit.setSelectAllOnFocus(True)
+        edit.setText(str(selected))
+        edit.setHint("1–1440 分钟")
+        theme_provider = self.timer_provider(viewer_ref)
+        if theme_provider is not None:
+            edit.setTextColor(self.theme.getColor(self.theme.key_dialogTextBlack, theme_provider))
+            edit.setHintTextColor(self.theme.getColor(self.theme.key_dialogTextGray2, theme_provider))
+        layout.addView(edit, self.layout_helper.createLinear(
+            jint(-1), jint(52), jint(51), jint(24), jint(0), jint(24), jint(0)))
+        builder = self.native_timer_alert(context, viewer_ref)
+        builder.setTitle("自定义分钟数")
+        builder.setView(layout)
+        builder.setPositiveButton("确定", None)
+        builder.setNegativeButton("取消", None)
+        dialog = self.show_native_timer_alert(builder, viewer_ref)
+        self.editor_dialog = self.weak(dialog)
+        button = dialog.getButton(-1)
+
+        def done(view):
+            minutes = duration_minutes(len(PRESETS), str(edit.getText()).strip())
+            if minutes is None:
+                edit.setError("请输入 1–1440 之间的整数")
+                return
+            accept(minutes)
+            dialog.dismiss()
+
+        button.setOnClickListener(self.timer_click(done))
+
+    def show_timer_fallback(self, anchor, viewer_ref, finish=None):
+        context = self.timer_context(anchor, viewer_ref)
+        finish = self.last_finish if finish is None else finish
+        options = [f"{value} 分钟" for value in PRESETS]
+        options.extend(("自定义时长", "播完当前媒体再停止 · " + ("已开启" if finish else "已关闭")))
+        if self.session is not None:
+            options.append("取消当前定时")
+        builder = self.native_timer_alert(context, viewer_ref)
+        status = self.timer_status()
+        builder.setTitle(f"睡眠定时 · {status}" if status else "睡眠定时")
+        plugin = self
+        generation = self.dialog_generation
+
+        def start(minutes):
+            if plugin.active:
+                plugin.start_timer(minutes, bool(finish), viewer_ref)
+
+        class OptionsListener(dynamic_proxy(self.dialog_option_listener)):
+            def onClick(self, dialog, which):
+                try:
+                    if not plugin.active or generation != plugin.dialog_generation:
+                        return
+                    if 0 <= which < len(PRESETS):
+                        start(PRESETS[which])
+                    elif which == len(PRESETS):
+                        plugin.run_timer_dialog_step(generation, lambda: plugin.edit_timer_minutes(
+                            anchor, viewer_ref, plugin.last_minutes, start), 120)
+                    elif which == len(PRESETS) + 1:
+                        plugin.run_timer_dialog_step(generation,
+                            lambda: plugin.show_timer_fallback(anchor, viewer_ref, not finish), 120)
+                    elif which == len(PRESETS) + 2:
+                        plugin.clear()
+                except Exception as error:
+                    plugin.log(f"Timer option failed: {type(error).__name__}: {error}")
+
+        builder.setItems(self.timer_labels(options), OptionsListener())
+        self.dialog = self.weak(self.show_native_timer_alert(builder, viewer_ref))
+        self.dialog_is_sheet = False
+
+    def start_timer(self, minutes, finish, viewer_ref):
+        self.clear()
+        self.last_minutes, self.last_finish = minutes, finish
+        self.session = (self.clock.elapsedRealtime() + minutes * 60000, finish, viewer_ref)
+        self.tick()
+
+    def follow_background_audio(self, viewer):
+        if self.session is None:
+            return
+        deadline, finish, viewer_ref = self.session
+        if viewer_ref is None or viewer_ref.get() != viewer:
+            return
+        self.session = (deadline, finish, None)
+        if self.waiting is not None:
+            _, _, new_key = self.target()
+            self.waiting = (self.waiting[0], new_key, self.waiting[2])
+        self.request_countdown()
+
+    def target(self):
+        viewer_ref = self.session[2]
+        if viewer_ref is not None:
+            viewer = viewer_ref.get()
+            if viewer is None:
+                return None, None, None
+            return viewer.getVideoPlayer(), None, self.current_index.getInt(viewer)
+        message = self.controller.getPlayingMessageObject()
+        if message is None:
+            return None, None, None
+        player = self.audio_player.get(self.controller)
+        if player is None:
+            player = self.controller.getVideoPlayer()
+        key = (int(message.currentAccount), int(message.getDialogId()), int(message.getId()))
+        return player, message, key
+
+    def tick(self):
+        if not self.active or self.session is None:
+            return
+        remaining = self.session[0] - self.clock.elapsedRealtime()
+        if remaining > 0:
+            self.handler.postDelayed(self.tick_runnable, remaining)
+            return
+        player, message, key = self.target()
+        if player is None:
+            self.clear()
+        elif self.waiting is not None:
+            if self.waiting[:2] != (player, key) or not player.isPlaying():
+                self.clear()
+            else:
+                self.handler.postDelayed(self.tick_runnable, 750)
+        elif self.session[1] and player.isPlaying():
+            self.wait_at_end(player, key)
+            self.request_countdown()
+            self.handler.postDelayed(self.tick_runnable, 750)
+        else:
+            self.stop(player, message)
+
+    def run_tick(self):
+        try:
+            self.tick()
+        except Exception as error:
+            self.log(f"Playback timer failed: {type(error).__name__}")
+            self.clear()
+
+    def wait_at_end(self, player, key):
+        looping = bool(player.isLooping())
+        self.waiting = (player, key, looping)
+        if looping:
+            player.setLooping(False)
+
+    def reached_deadline_for(self, player):
+        if not self.active or self.session is None or self.clock.elapsedRealtime() < self.session[0]:
+            return None
+        target, message, key = self.target()
+        if target != player or (self.waiting is not None and self.waiting[:2] != (player, key)):
+            return None
+        return message, key
+
+    def before_player_state(self, param):
+        player = param.thisObject
+        current = self.reached_deadline_for(player)
+        if current is None:
+            return
+        message, _ = current
+        engine = player.player
+        if engine is None:
+            return
+        state = int(engine.getPlaybackState())
+        audio_end = (message is not None
+                     and (state == STATE_ENDED or (state in (1, 2)
+                          and engine.getPlayWhenReady() and message.audioProgress >= 0.999)))
+        if audio_end:
+            # Suppress the delegate's automatic advance and keep the current item paused.
+            param.setResult(None)
+            self.stop(player, message, rewind=True)
+
+    def after_player_state(self, param):
+        player = param.thisObject
+        current = self.reached_deadline_for(player)
+        if current is not None and current[0] is None and player.player is not None:
+            if player.player.getPlaybackState() == STATE_ENDED:
+                self.stop(player, None)
+
+    def before_repeat(self, param):
+        if int(param.args[2]) != 0:  # DISCONTINUITY_REASON_AUTO_TRANSITION
+            return
+        player = param.thisObject
+        current = self.reached_deadline_for(player)
+        if current is not None:
+            self.stop(player, current[0])
+
+    def stop(self, player, message, *, rewind=False):
+        viewer_ref = self.session[2]
+        self.clear(restore_loop=False)
+        try:
+            if message is not None:
+                self.controller.pauseMessage(message, False)
+                if rewind:
+                    player.seekTo(0)
+            else:
+                viewer = viewer_ref.get() if viewer_ref else None
+                if viewer is not None:
+                    self.manually_paused.setBoolean(viewer, True)
+                player.pause()
+        finally:
+            self.restore_loop()
+
+    def restore_loop(self):
+        waiting, self.waiting = self.waiting, None
+        if waiting is not None and waiting[2] and waiting[0].player is not None:
+            waiting[0].setLooping(True)
+
+    def clear(self, *, restore_loop=True):
+        self.session = None
+        self.handler.removeCallbacks(self.tick_runnable)
+        if restore_loop:
+            self.restore_loop()
+        self.request_countdown()
+
+    def on_plugin_unload(self):
+        self.active = False
+        for hook in self.hooks:
+            self.unhook_method(hook)
+
+        def restore():
+            self.clear()
+            self.run_countdown()
+            self.dismiss_timer_ui()
+            for _, row_ref, _ in self.menus:
+                row = row_ref.get()
+                if row is not None and row.getParent() is not None:
+                    row.getParent().removeView(row)
+            self.menus.clear()
+            for audio_ref, timer_ref, listener in self.audio_rows:
+                audio, timer = audio_ref.get(), timer_ref.get()
+                if audio is not None:
+                    self.audio_layout.get(audio).removeOnLayoutChangeListener(listener)
+                    if timer is not None:
+                        self.style_audio_track_icons(audio, timer.getParent(), restore=True)
+                    self.update_audio_footer(audio, restore=self.option("hide_audio_profile_button"))
+                if timer is not None and timer.getParent() is not None:
+                    timer.getParent().removeView(timer)
+            self.audio_rows.clear()
+
+        run_on_ui_thread(restore)

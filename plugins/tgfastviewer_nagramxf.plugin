@@ -1,0 +1,707 @@
+# Based on TGFastViewer by dunxuan.
+# Upstream: https://github.com/dunxuan/tgfastviewer
+# SPDX-License-Identifier: GPL-3.0-only
+# Modified for NagramXF on 2026-11-25. This version's new changes are distributed under GPLv3.
+# The upstream code and code previously released under MIT remain available under MIT.
+#
+# MIT License
+#
+# Copyright (c) 2026 dunxuan
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin
+from client_utils import RequestCallback
+from java import jarray, jclass
+
+__id__ = "tgfastviewer_nagramxf"
+__name__ = "TG快点滑 · NagramXF"
+__description__ = "从打开的媒体附近快速加载、持续补页，并保留完整相册分组。"
+__author__ = "dunxuan / NagramXF adaptation"
+__version__ = "1.0.3"
+__app_version__ = ">=12.10.1"
+
+TAG = "TgFastViewerNative"
+WINDOW = 64
+PAGE_LIMIT = 65
+ALBUM_LIMIT = 10
+EDGE_MARGIN = 6
+PAGE_INDEX_START = -1000000
+TIMEOUT_MS = 6000
+FILTERS = (
+    "PhotoVideo", "Document", "RoundVoice", "Url", "Music", "Gif",
+    "Photos", "Video", "Poll",
+)
+
+
+def declared_method(owner, name, arity):
+    matches = [method for method in owner.getDeclaredMethods()
+               if method.getName() == name and len(method.getParameterTypes()) == arity]
+    if len(matches) != 1:
+        raise RuntimeError(f"Cannot resolve {owner.getName()}.{name}/{arity}")
+    method = matches[0]
+    method.setAccessible(True)
+    return method
+
+
+def ordered_messages(messages, *, older=True, boundary=None):
+    unique = {}
+    for index in range(messages.size()):
+        item = messages.get(index)
+        if item.id > 0 and (boundary is None or (item.id < boundary if older else item.id > boundary)):
+            unique[item.id] = item
+    return sorted(unique.values(), key=lambda item: item.id, reverse=older)
+
+
+def album_cut(items, target, keep_group=0):
+    """Take a prefix without slicing through an album at its far end."""
+    end = min(target, len(items))
+    group = items[end - 1].grouped_id
+    if not group:
+        return end, False
+    while end < len(items) and items[end].grouped_id == group:
+        end += 1
+    if end < len(items):
+        return end, False
+
+    start = end - 1
+    while start > 0 and items[start - 1].grouped_id == group:
+        start -= 1
+    if end - start >= ALBUM_LIMIT:
+        return end, False
+    if start == 0 or group == keep_group:
+        return end, True
+    # The next page starts before this group and can take it as a unit.
+    return start, False
+
+
+class FastViewerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.logcat = jclass("android.util.Log")
+        self.looper = jclass("android.os.Looper")
+        self.conn = jclass("org.telegram.tgnet.ConnectionsManager")
+        self.messages = jclass("org.telegram.messenger.MessagesController")
+        self.chat = jclass("org.telegram.messenger.ChatObject")
+        self.dialog = jclass("org.telegram.messenger.DialogObject")
+        self.users = jclass("org.telegram.messenger.UserConfig")
+        self.search = jclass("org.telegram.tgnet.TLRPC$TL_messages_search")
+        self.response_type = jclass("org.telegram.tgnet.TLRPC$messages_Messages").getClass()
+        self.media_filters = [jclass("org.telegram.tgnet.TLRPC$TL_inputMessagesFilter" + name)
+                              for name in FILTERS]
+        self.bridge = jclass("de.robv.android.xposed.XposedBridge")
+        self.box_int = jclass("java.lang.Integer")
+        self.box_long = jclass("java.lang.Long")
+        self.box_bool = jclass("java.lang.Boolean")
+        self.array_list = jclass("java.util.ArrayList")
+        self.object_array = jarray(jclass("java.lang.Object"))
+
+        viewer = jclass("org.telegram.ui.PhotoViewer").getClass()
+        media = jclass("org.telegram.messenger.MediaDataController").getClass()
+        notification_center = jclass("org.telegram.messenger.NotificationCenter")
+        self.count_event = notification_center.mediaCountDidLoad
+        self.media_event = notification_center.mediaDidLoad
+        self.fields = {}
+        for name in (
+            "classGuid", "currentAccount", "currentDialogId", "topicId", "mergeDialogId",
+            "currentFiltered", "opennedFromMedia", "needSearchImageInArr", "sharedMediaType",
+            "currentMessageObject", "currentIndex", "imagesArr", "imagesByIds", "countView",
+            "loadingMoreImages",
+        ):
+            field = viewer.getDeclaredField(name)
+            field.setAccessible(True)
+            self.fields[name] = field
+
+        self.load_media = declared_method(media, "loadMedia", 12)
+        self.deliver = declared_method(media, "processLoadedMedia", 13)
+        self.set_index = declared_method(viewer, "setImageIndex", 4)
+        notification = declared_method(viewer, "didReceivedNotification", 3)
+        draw = declared_method(self.fields["countView"].getType(), "onDraw", 1)
+        self.viewer_stack = []
+        self.hidden_counter = None
+        self.pending = {}
+        self.gallery = None
+        self.page_index = PAGE_INDEX_START
+        self.enabled = True
+        self.hooks = []
+        try:
+            for method, before, after in (
+                (self.load_media, self.before_load, None),
+                (draw, self.before_draw, None),
+                (notification, self.before_notification, self.after_notification),
+                (self.set_index, None, self.after_index),
+            ):
+                handle = self.hook_method(method, before=before, after=after)
+                if handle is None:
+                    raise RuntimeError(f"Hook rejected for {method.getName()}")
+                self.hooks.append(handle)
+        except Exception:
+            self.enabled = False
+            for handle in self.hooks:
+                self.unhook_method(handle)
+            self.hooks.clear()
+            raise
+        self.logcat.i(TAG, "NagramXF native media hooks ready")
+
+    def on_plugin_unload(self):
+        self.enabled = False
+        for handle in getattr(self, "hooks", ()):
+            self.unhook_method(handle)
+        if not hasattr(self, "pending"):
+            return
+        self.hooks.clear()
+
+        def finish():
+            load = self.gallery
+            self.gallery = None
+            if load is not None:
+                load.cancel_page()
+                if self.active(load):
+                    self.fields["loadingMoreImages"].setBoolean(load.viewer, False)
+            hidden = self.hidden_counter
+            if hidden is not None:
+                self.restore_counter(hidden)
+            for load in tuple(self.pending.values()):
+                load.timeout()
+
+        run_on_ui_thread(finish)
+
+    def before_notification(self, param):
+        if self.looper.myLooper() != self.looper.getMainLooper():
+            return
+        if param.args[0] == self.count_event:
+            self.viewer_stack.append(param.thisObject)
+        elif param.args[0] == self.media_event:
+            load = self.gallery
+            args = param.args[2]
+            if (load is not None and len(args) >= 8 and args[0] == load.dialog
+                    and args[4] == load.media_type and args[3] == args[7]
+                    and args[7] <= PAGE_INDEX_START and param.thisObject == load.viewer):
+                param.setResult(None)
+                if self.enabled and self.active(load):
+                    load.on_page_ready(args[7], args[2])
+
+    def after_notification(self, param):
+        if (self.looper.myLooper() == self.looper.getMainLooper()
+                and param.args[0] == self.count_event and self.viewer_stack):
+            self.viewer_stack.pop()
+
+    def active(self, load):
+        view = load.viewer
+        fields = self.fields
+        return (view.isVisible() and fields["classGuid"].getInt(view) == load.guid
+                and fields["currentAccount"].getInt(view) == load.account
+                and fields["currentDialogId"].getLong(view) == load.dialog
+                and fields["topicId"].getLong(view) == load.topic
+                and fields["sharedMediaType"].getInt(view) == load.media_type
+                and not fields["currentFiltered"].getBoolean(view)
+                and not fields["opennedFromMedia"].getBoolean(view))
+
+    def after_index(self, param):
+        load = self.gallery
+        if self.enabled and load is not None and param.thisObject == load.viewer and self.active(load):
+            load.prefetch()
+
+    def restore_counter(self, load):
+        if self.hidden_counter is load:
+            self.hidden_counter = None
+            load.counter.invalidate()
+
+    def before_draw(self, param):
+        load = self.hidden_counter
+        if load is not None:
+            if not self.enabled or not self.active(load):
+                self.hidden_counter = None
+            elif load.counter == param.thisObject:
+                param.setResult(None)
+
+    def before_load(self, param):
+        if not self.enabled or self.looper.myLooper() != self.looper.getMainLooper():
+            return
+        args = param.args
+        dialog, count, max_id, min_id, media_type, topic, source, guid = (args[i] for i in range(8))
+        if (not dialog or not guid or source != 1
+                or media_type < 0 or media_type >= len(self.media_filters)
+                or args[9] is not None or args[10] or args[11]):
+            return
+
+        gallery = self.gallery
+        if (count == 80 and max_id > 0 and not min_id and gallery is not None
+                and (dialog, topic, media_type, guid)
+                == (gallery.dialog, gallery.topic, gallery.media_type, gallery.guid)
+                and self.active(gallery)):
+            # The plugin schedules both directions for this gallery.
+            param.setResult(None)
+            return
+
+        if (not self.viewer_stack or count != 20 or max_id or min_id or guid in self.pending
+                or self.dialog.isEncryptedDialog(dialog)):
+            return
+
+        view = self.viewer_stack[-1]
+        fields = self.fields
+        if (fields["classGuid"].getInt(view) != guid
+                or fields["currentDialogId"].getLong(view) != dialog
+                or fields["topicId"].getLong(view) != topic
+                or fields["mergeDialogId"].getLong(view)
+                or fields["currentFiltered"].getBoolean(view)
+                or fields["opennedFromMedia"].getBoolean(view)
+                or not fields["needSearchImageInArr"].getBoolean(view)):
+            return
+        message = fields["currentMessageObject"].get(view)
+        images = fields["imagesArr"].get(view)
+        if (message is None or images.size() != 1 or images.get(0) != message
+                or message.getDialogId() != dialog or message.isHiddenSensitive()
+                or message.getId() <= 0):
+            return
+
+        try:
+            load = WindowLoad(self, view, message.getId(), param.thisObject, args)
+            if load.start():
+                param.setResult(None)
+        except Exception as error:
+            self.logcat.w(TAG, f"Could not start media window ({type(error).__name__})")
+
+
+class WindowLoad:
+    def __init__(self, plugin, viewer, anchor, controller, args):
+        self.plugin = plugin
+        self.viewer = viewer
+        self.controller = controller
+        self.args = args
+        self.dialog, self.media_type, self.topic, self.guid = args[0], args[4], args[5], args[7]
+        self.account = plugin.fields["currentAccount"].getInt(viewer)
+        self.counter = plugin.fields["countView"].get(viewer)
+        self.anchor = anchor
+        self.messages = plugin.messages.getInstance(self.account)
+        self.connection = plugin.conn.getInstance(self.account)
+        self.token = 0
+        self.cursors = {}
+        self.ends = set()
+        self.page = None
+        self.retried = {}
+
+    def start(self):
+        p = self.plugin
+        self.token = self.send(
+            self.anchor, WINDOW + 2 * ALBUM_LIMIT, -(WINDOW // 2 + ALBUM_LIMIT + 1), self.on_window,
+        )
+        if not self.token:
+            return False
+        p.pending[self.guid] = self
+        if self.counter is not None:
+            p.hidden_counter = self
+            self.counter.invalidate()
+        run_on_ui_thread(self.timeout, TIMEOUT_MS)
+        p.logcat.i(TAG, "Requested media window")
+        return True
+
+    def send(self, offset, limit, add_offset, callback, *, max_id=0, min_id=0):
+        p = self.plugin
+        request = p.search()
+        request.peer = self.messages.getInputPeer(self.dialog)
+        if request.peer is None:
+            return 0
+        request.filter = p.media_filters[self.media_type]()
+        request.q = ""
+        request.offset_id = offset
+        request.limit = limit
+        request.add_offset = add_offset
+        request.max_id = max_id
+        request.min_id = min_id
+        if self.topic:
+            if self.dialog == p.users.getInstance(self.account).getClientUserId():
+                request.saved_peer_id = self.messages.getInputPeer(self.topic)
+                if request.saved_peer_id is None:
+                    return 0
+                request.flags |= 4
+            else:
+                if not (0 < self.topic <= 2147483647):
+                    return 0
+                request.top_msg_id = self.topic
+                request.flags |= 2
+        delegate = RequestCallback(
+            lambda result, error: run_on_ui_thread(lambda: callback(result, error)),
+            self.account,
+        )
+        token = self.connection.sendRequest(request, delegate)
+        if token:
+            try:
+                self.connection.bindRequestToGuid(token, self.guid)
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not bind media request ({type(error).__name__})")
+        return token
+
+    def send_page(self, direction, boundary, limit, callback):
+        older = direction == "older"
+        return self.send(
+            boundary, limit, 0 if older else -limit, callback,
+            max_id=boundary if older else 0, min_id=0 if older else boundary,
+        )
+
+    def deliver(self, response, max_id, min_id, request_index, *, pagination=False):
+        p = self.plugin
+        channel = self.dialog < 0 and p.chat.isChannel(-self.dialog, self.account)
+        # A separate notification GUID lets the client ignore a late page after plugin unload.
+        notification_guid = request_index if pagination else self.guid
+        values = p.object_array([
+            response, p.box_long(self.dialog), p.box_int(PAGE_LIMIT if pagination else WINDOW), p.box_int(max_id),
+            p.box_int(min_id), p.box_int(self.media_type), p.box_long(self.topic), p.box_int(0),
+            p.box_int(notification_guid), p.box_bool(channel), p.box_bool(False),
+            p.box_int(request_index), p.box_bool(self.args[11]),
+        ])
+        p.bridge.invokeOriginalMethod(p.deliver, self.controller, values)
+
+    def take_pending(self):
+        if self.plugin.pending.get(self.guid) is not self:
+            return False
+        del self.plugin.pending[self.guid]
+        return True
+
+    def results(self, response, error):
+        p = self.plugin
+        if error is not None or not p.response_type.isInstance(response):
+            return ()
+        # Use the same deletion filter as NagramXF's native media search.
+        self.messages.removeDeletedMessagesFromArray(self.dialog, response.messages)
+        messages = response.messages
+        return tuple(messages.get(i).id for i in range(messages.size()))
+
+    def on_window(self, response, error):
+        p = self.plugin
+        if p.pending.get(self.guid) is not self:
+            return
+        if not p.enabled or not p.active(self) or error is not None or not p.response_type.isInstance(response):
+            self.window_failed()
+            return
+        try:
+            items = ordered_messages(response.messages)
+            anchor_index = next((i for i, item in enumerate(items) if item.id == self.anchor), None)
+            if anchor_index is None:
+                self.window_failed()
+                return
+            group = items[anchor_index].grouped_id
+            older = items[anchor_index:]
+            newer = items[anchor_index::-1]
+            old_end, check_old = album_cut(older, WINDOW // 2, group)
+            new_end, check_new = album_cut(newer, WINDOW // 2 + 1, group)
+            selected = newer[new_end - 1:0:-1] + older[:old_end]
+            directions = tuple(direction for direction, check in (
+                ("older", check_old), ("newer", check_new),
+            ) if check)
+            self.confirm_albums(response, selected, directions)
+        except Exception as failure:
+            self.window_failed(type(failure).__name__)
+
+    def window_failed(self, reason=None):
+        if self.take_pending():
+            if reason is not None:
+                self.plugin.logcat.w(TAG, f"Could not load media window ({reason})")
+            self.fallback()
+
+    def commit_window(self, response, items):
+        if not self.take_pending():
+            return
+        p = self.plugin
+        if not p.enabled or not p.active(self):
+            self.fallback()
+            return
+        try:
+            response.messages = self.java_messages(items)
+            ids = self.results(response, None)
+            if self.anchor not in ids:
+                self.fallback()
+                return
+            top = items[0].id
+            self.cursors = {"older": items[-1].id, "newer": top}
+            if p.gallery is not None:
+                p.gallery.cancel_page()
+            p.gallery = self
+            # Bounded max_id keeps the client's media cache and deleted-media window accurate.
+            self.deliver(response, top, 0, self.args[8])
+        except Exception as failure:
+            if p.gallery is self:
+                p.gallery = None
+            p.logcat.w(TAG, f"Could not deliver media window: {failure}")
+            self.fallback()
+            return
+        p.logcat.i(TAG, f"Delivered {len(ids)} media items")
+        run_on_ui_thread(lambda: self.probe(top), 300)
+
+    def java_messages(self, items):
+        messages = self.plugin.array_list()
+        for item in items:
+            messages.add(item)
+        return messages
+
+    def confirm_albums(self, response, items, directions, page=None):
+        p = self.plugin
+
+        def is_pending():
+            return self.page is page if page is not None else p.pending.get(self.guid) is self
+
+        def fail(reason):
+            if page is not None:
+                self.fail_page(page, reason)
+            else:
+                self.window_failed(reason)
+
+        if not is_pending():
+            return
+        if not p.enabled or not p.active(self):
+            fail("viewer changed")
+            return
+        if not directions:
+            if page is not None:
+                self.commit_page(page, response, items)
+            else:
+                self.commit_window(response, items)
+            return
+
+        direction = directions[0]
+        older = direction == "older"
+        edge = items[-1] if older else items[0]
+        group = edge.grouped_id
+        if sum(item.grouped_id == group for item in items) >= ALBUM_LIMIT:
+            self.confirm_albums(response, items, directions[1:], page)
+            return
+
+        def on_extension(reply, error):
+            if not is_pending():
+                return
+            if error is not None or not p.response_type.isInstance(reply):
+                fail("album lookup failed")
+                return
+            try:
+                beyond = ordered_messages(reply.messages, older=older, boundary=edge.id)
+                siblings = []
+                for item in beyond:
+                    if item.grouped_id != group:
+                        break
+                    siblings.append(item)
+                if siblings:
+                    response.users.addAll(reply.users)
+                    response.chats.addAll(reply.chats)
+                combined = items + siblings if older else list(reversed(siblings)) + items
+                next_edges = directions[1:] if not beyond or len(siblings) < len(beyond) else directions
+                self.confirm_albums(response, combined, next_edges, page)
+            except Exception as error:
+                fail(type(error).__name__)
+
+        try:
+            token = self.send_page(direction, edge.id, ALBUM_LIMIT + 1, on_extension)
+            if not token:
+                fail("album lookup did not start")
+            elif page is not None:
+                page.token = token
+            else:
+                self.token = token
+        except Exception as error:
+            fail(type(error).__name__)
+
+    def probe(self, top):
+        p = self.plugin
+
+        def on_newest(response, error):
+            if not p.enabled or p.hidden_counter is not self or not p.active(self):
+                return
+            ids = self.results(response, error)
+            if ids and ids[0] == top == self.cursors["newer"]:
+                self.ends.add("newer")
+                p.restore_counter(self)
+
+        if p.enabled and p.hidden_counter is self and p.active(self):
+            try:
+                self.send(0, 1, 0, on_newest)
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not verify media count ({type(error).__name__})")
+
+    def prefetch(self):
+        p = self.plugin
+        fields = p.fields
+        if (not p.enabled or p.gallery is not self or self.page is not None or not p.active(self)
+                or fields["needSearchImageInArr"].getBoolean(self.viewer)):
+            return
+        index = fields["currentIndex"].getInt(self.viewer)
+        size = fields["imagesArr"].get(self.viewer).size()
+        if not 0 <= index < size:
+            return
+        if index < EDGE_MARGIN and "older" not in self.ends:
+            direction = "older"
+        elif size - 1 - index < EDGE_MARGIN and "newer" not in self.ends:
+            direction = "newer"
+        else:
+            return
+
+        boundary = self.cursors[direction]
+        page = MediaPage(direction, boundary, p.page_index)
+        p.page_index -= 1
+        self.page = page
+        try:
+            page.token = self.send_page(
+                direction, boundary, PAGE_LIMIT + ALBUM_LIMIT,
+                lambda response, error: self.on_page_response(page, response, error),
+            )
+        except Exception as error:
+            self.fail_page(page, type(error).__name__)
+            return
+        if not page.token:
+            self.fail_page(page, "request did not start")
+            return
+        p.logcat.i(TAG, f"Requested {direction} media page")
+        run_on_ui_thread(lambda: self.page_timeout(page), TIMEOUT_MS)
+
+    def on_page_response(self, page, response, error):
+        p = self.plugin
+        if self.page is not page:
+            return
+        if not p.enabled or p.gallery is not self or not p.active(self):
+            self.page = None
+            return
+        if error is not None or not p.response_type.isInstance(response):
+            self.fail_page(page, "search failed")
+            return
+
+        try:
+            older = page.direction == "older"
+            items = ordered_messages(response.messages, older=older, boundary=page.boundary)
+            if not items:
+                self.ends.add(page.direction)
+                if not older:
+                    p.restore_counter(self)
+                self.finish_page(page)
+                return
+
+            end, check = album_cut(items, PAGE_LIMIT)
+            selected = items[:end] if older else items[end - 1::-1]
+            self.confirm_albums(response, selected, (page.direction,) if check else (), page)
+        except Exception as failure:
+            self.fail_page(page, type(failure).__name__)
+
+    def commit_page(self, page, response, items):
+        older = page.direction == "older"
+        try:
+            page.next_cursor = (items[-1] if older else items[0]).id
+            selected = self.java_messages(items)
+            self.messages.removeDeletedMessagesFromArray(self.dialog, selected)
+            if selected.isEmpty():
+                self.finish_page(page)
+                return
+
+            response.messages = selected
+            self.deliver(response, page.boundary if older else 0,
+                         0 if older else page.boundary, page.request_index, pagination=True)
+        except Exception as failure:
+            self.fail_page(page, type(failure).__name__)
+
+    def on_page_ready(self, request_index, items):
+        p = self.plugin
+        page = self.page
+        if page is None or request_index != page.request_index:
+            return
+        try:
+            images = p.fields["imagesArr"].get(self.viewer)
+            index_field = p.fields["currentIndex"]
+            index = index_field.getInt(self.viewer)
+            if not 0 <= index < images.size():
+                self.page = None
+                return
+
+            older = page.direction == "older"
+            edge = images.get(0 if older else images.size() - 1).getId()
+            index_by_id = p.fields["imagesByIds"].get(self.viewer)[0]
+            additions = {}
+            for i in range(items.size()):
+                item = items.get(i)
+                message_id = item.getId()
+                if ((0 < message_id < edge if older else message_id > edge)
+                        and index_by_id.indexOfKey(message_id) < 0 and not item.isHiddenSensitive()):
+                    additions[message_id] = item
+
+            if additions:
+                ordered = p.array_list()
+                for message_id in sorted(additions):
+                    item = additions[message_id]
+                    ordered.add(item)
+                    index_by_id.put(message_id, item)
+                images.addAll(0 if older else images.size(), ordered)
+                index += len(additions) if older else 0
+                # Refresh both neighboring receivers while preserving the current photo/video.
+                index_field.setInt(self.viewer, index)
+                args = p.object_array([
+                    p.box_int(index), p.box_bool(True), p.box_bool(False), p.box_bool(True),
+                ])
+                p.bridge.invokeOriginalMethod(p.set_index, self.viewer, args)
+                p.logcat.i(TAG, f"Added {len(additions)} {page.direction} media items")
+        except Exception as error:
+            self.fail_page(page, type(error).__name__)
+            return
+        self.finish_page(page)
+
+    def finish_page(self, page):
+        self.page = None
+        self.cursors[page.direction] = page.next_cursor
+        run_on_ui_thread(self.prefetch, 150)
+
+    def page_timeout(self, page):
+        if self.page is page:
+            self.cancel_page()
+            self.fail_page(page, "timed out")
+
+    def cancel_page(self):
+        page = self.page
+        self.page = None
+        if page is not None and page.token:
+            try:
+                self.connection.cancelRequest(page.token, True)
+            except Exception as error:
+                self.plugin.logcat.w(TAG, f"Could not cancel media page ({type(error).__name__})")
+
+    def fail_page(self, page, reason):
+        self.page = None
+        self.plugin.logcat.w(TAG, f"Could not load {page.direction} media page ({reason})")
+        if self.retried.get(page.direction) != page.boundary:
+            self.retried[page.direction] = page.boundary
+            run_on_ui_thread(self.prefetch, 1500)
+
+    def timeout(self):
+        if self.take_pending():
+            try:
+                self.connection.cancelRequest(self.token, True)
+            finally:
+                self.fallback()
+
+    def fallback(self):
+        p = self.plugin
+        p.restore_counter(self)
+        if p.active(self):
+            try:
+                p.bridge.invokeOriginalMethod(p.load_media, self.controller, self.args)
+                p.logcat.i(TAG, "Fell back to NagramXF media loading")
+            except Exception as error:
+                p.logcat.w(TAG, f"Could not restore media loading ({type(error).__name__})")
+
+
+class MediaPage:
+    def __init__(self, direction, boundary, request_index):
+        self.direction = direction
+        self.boundary = boundary
+        self.request_index = request_index
+        self.next_cursor = boundary
+        self.token = 0
