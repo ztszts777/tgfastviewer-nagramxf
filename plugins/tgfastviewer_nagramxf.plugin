@@ -35,7 +35,7 @@ __id__ = "tgfastviewer_nagramxf"
 __name__ = "TG快点滑 · NagramXF"
 __description__ = "从打开的媒体附近快速加载、持续补页，并保留完整相册分组。"
 __author__ = "dunxuan / NagramXF adaptation"
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __app_version__ = ">=12.10.1"
 
 TAG = "TgFastViewerNative"
@@ -532,17 +532,21 @@ class WindowLoad:
             except Exception as error:
                 p.logcat.w(TAG, f"Could not verify media count ({type(error).__name__})")
 
-    def prefetch(self):
+    def prefetch(self, index=None, direction=None):
         p = self.plugin
         fields = p.fields
         if (not p.enabled or p.gallery is not self or self.page is not None or not p.active(self)
                 or fields["needSearchImageInArr"].getBoolean(self.viewer)):
             return
-        index = fields["currentIndex"].getInt(self.viewer)
+        if index is None:
+            index = fields["currentIndex"].getInt(self.viewer)
         size = fields["imagesArr"].get(self.viewer).size()
         if not 0 <= index < size:
             return
-        if index < EDGE_MARGIN and "older" not in self.ends:
+        if direction is not None:
+            if direction in self.ends:
+                return
+        elif index < EDGE_MARGIN and "older" not in self.ends:
             direction = "older"
         elif size - 1 - index < EDGE_MARGIN and "newer" not in self.ends:
             direction = "newer"

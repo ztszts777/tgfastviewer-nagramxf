@@ -11,10 +11,13 @@ __id__ = "ayufilter_display_fix"
 __name__ = "AyuGram 消息过滤显示修复"
 __description__ = "修复过滤后的日期、聊天预览、置顶消息和共享媒体列表，沿用聊天自己的过滤规则。"
 __author__ = "Codex"
-__version__ = "1.0.7"
+__version__ = "1.0.9"
 __app_version__ = ">=12.10.1"
 
 PAGE_SIZE = 32
+PREVIEW_CACHE_SIZE = 256
+PREVIEW_WARM_ROWS = 12
+PREVIEW_WARM_SCAN = 192
 HIDDEN_ROW = -1000
 DENSE_MEDIA_TABS = (0, 1, 2, 4)
 FAST_VIEWER_PAGE_INDEX = -1000000
@@ -95,8 +98,12 @@ class AyuFilterDisplayFix(BasePlugin):
         self.pinned_chats = []
         self.pinned_frames = []
         self.cache = OrderedDict()
+        self.preview_rules_pending = None
         self.queued = OrderedDict()
         self.running = {}
+        self.preview_drain_pending = False
+        self.preview_warm_accounts = {}
+        self.preview_warm_at = {}
         self.hooks = []
         self.weak = jclass("java.lang.ref.WeakReference")
         self.system = jclass("java.lang.System")
@@ -105,6 +112,7 @@ class AyuFilterDisplayFix(BasePlugin):
         self.object_array = jarray(jclass("java.lang.Object"))
         self.ayu = jclass("tw.nekomimi.nekogram.filters.AyuFilter")
         self.mc = jclass("org.telegram.messenger.MessagesController")
+        self.account_instance = jclass("org.telegram.messenger.AccountInstance")
         self.chat_object = jclass("org.telegram.messenger.ChatObject")
         self.dialog_object = jclass("org.telegram.messenger.DialogObject")
         self.storage = jclass("org.telegram.messenger.MessagesStorage")
@@ -121,6 +129,8 @@ class AyuFilterDisplayFix(BasePlugin):
         self.filters_changed = events.regexFiltersUpdated
         self.messages_deleted = events.messagesDeleted
         self.messages_loaded = events.messagesDidLoad
+        self.dialogs_loaded = events.dialogsNeedReload
+        self.dialog_folders_changed = events.dialogFiltersUpdated
         self.date_events = {self.messages_loaded, events.didReceiveNewMessages,
                             events.messagesDeleted, events.replaceMessagesObjects}
         self.pinned_events = {events.pinnedInfoDidLoad, events.didLoadPinnedMessages}
@@ -180,6 +190,8 @@ class AyuFilterDisplayFix(BasePlugin):
                                            after=self.after_cell_attach))
         self.hooks.append(self.hook_method(method(dialogs, "didReceivedNotification", 3),
                                            after=self.after_dialogs_event))
+        self.hooks.append(self.hook_method(method(dialogs, "onResume", 0),
+                                           after=lambda param: self.schedule_preview_warm(param.thisObject.getCurrentAccount())))
         layout = jclass("org.telegram.ui.Components.SharedMediaLayout").getClass()
         page = jclass("org.telegram.ui.Components.SharedMediaLayout$MediaPage").getClass()
         shared = jclass("org.telegram.ui.Components.SharedMediaLayout$SharedMediaData").getClass()
@@ -247,10 +259,11 @@ class AyuFilterDisplayFix(BasePlugin):
                                            priority=100, before=self.before_viewer_page))
         self.hooks.append(self.hook_method(method(viewer, "onPhotoClosed", 1),
                                            before=self.clear_viewer_cursors))
-        for name, arity in (("rebuildCache", 0), ("invalidateFilteredCache", 0),
-                            ("onMessageEdited", 2)):
-            self.hooks.append(self.hook_method(method(self.ayu.getClass(), name, arity),
+        for name in ("rebuildCache", "invalidateFilteredCache"):
+            self.hooks.append(self.hook_method(method(self.ayu.getClass(), name, 0),
                                                after=self.after_filter_change))
+        self.hooks.append(self.hook_method(method(self.ayu.getClass(), "onMessageEdited", 2),
+                                           after=self.after_preview_edit))
 
     def media_hidden(self, message, chat=None, group=None):
         if message is None or message.messageOwner is None:
@@ -885,17 +898,23 @@ class AyuFilterDisplayFix(BasePlugin):
                 observed[stable_id] = visible
         self.date_visibility = observed
 
-    def preview_key(self, cell):
+    def preview_scope(self, cell):
         if not cell.isDialogCell or cell.insideCommunityListNoDialog:
-            return None
-        account = self.account.getInt(cell)
-        if self.cell_message.get(cell) != self.dummies[account]:
             return None
         if cell.isDialogFolder() or cell.isDialogCommunity():
             return None
-        dialog_id = int(cell.getDialogId())
+        return int(self.account.getInt(cell)), int(cell.getDialogId())
+
+    def preview_key(self, cell, scope=None):
+        scope = self.preview_scope(cell) if scope is None else scope
+        if scope is None or self.cell_message.get(cell) != self.dummies[scope[0]]:
+            return None
+        account, dialog_id = scope
         controller = self.mc.getInstance(account)
         dialog = controller.dialogs_dict.get(dialog_id)
+        return self.dialog_preview_key(account, dialog_id, dialog, controller)
+
+    def dialog_preview_key(self, account, dialog_id, dialog, controller):
         if dialog is None or not dialog.top_message:
             return None
         if dialog.top_message < 0 and not self.dialog_object.isEncryptedDialog(dialog_id):
@@ -909,28 +928,74 @@ class AyuFilterDisplayFix(BasePlugin):
     def before_layout(self, param):
         self.layouts.append(None)
         cell = param.thisObject
-        key = self.preview_key(cell)
+        scope = self.preview_scope(cell)
+        if scope is None:
+            return
+        key = self.preview_key(cell, scope)
         if key is None:
+            self.remember_native_preview(cell, scope)
             return
-        entry = self.cache.get(key)
-        if entry is None or (entry[0] <= monotonic() and key not in self.running):
+        checked, retry_at, candidate = self.cache.get(scope, (None, None, None))
+        if checked != key and candidate is not None and not self.allowed(*candidate, scope):
+            checked = retry_at = candidate = None
+            self.store_preview(scope, checked, retry_at, candidate)
+        if checked != key or (retry_at is not None and retry_at <= monotonic()):
             self.schedule(cell, key)
-            return
-        self.cache.move_to_end(key)
-        candidate = entry[1]
+        else:
+            self.track_cell(cell, key)
         if candidate is None:
             return
+        self.cache.move_to_end(scope)
         message, group = candidate
-        if not self.allowed(message, group, key):
-            self.cache.pop(key, None)
-            self.schedule(cell, key)
-            return
-        self.track_cell(cell, key)
         self.layouts[-1] = (cell, self.cell_message.get(cell), self.cell_group.get(cell),
                             self.cell_date.getInt(cell))
         self.cell_message.set(cell, message)
         self.cell_group.set(cell, group.messages if group is not None else None)
         self.cell_date.setInt(cell, message.messageOwner.date)
+
+    def store_preview(self, scope, checked, retry_at, candidate):
+        self.cache[scope] = checked, retry_at, candidate
+        self.cache.move_to_end(scope)
+        if len(self.cache) > PREVIEW_CACHE_SIZE:
+            self.cache.popitem(last=False)
+
+    def preview_rank(self, scope, message):
+        mid = int(message.getId())
+        return (-mid if self.dialog_object.isEncryptedDialog(scope[1]) else mid,
+                int(message.messageOwner.edit_date))
+
+    def preview_members(self, candidate):
+        message, group = candidate
+        if group is None:
+            return (message,)
+        return tuple(group.messages.get(i) for i in range(group.messages.size()))
+
+    def make_preview_group(self, group_id, members):
+        group = self.album()
+        group.groupId = group_id
+        for member in members:
+            group.messages.add(member)
+        group.calculate()
+        return group
+
+    def remember_native_preview(self, cell, scope):
+        message = self.cell_message.get(cell)
+        if (message is None or message == self.dummies[scope[0]] or message.messageOwner is None
+                or message.getDialogId() != scope[1]):
+            return
+        if scope not in self.cache and not (self.ayu.shouldHideFilteredMessages()
+                                             or self.ayu.shouldHideIgnoredBlockedMessages()):
+            return
+        checked, retry_at, previous = self.cache.get(scope, (None, None, None))
+        rank = self.preview_rank(scope, message)
+        if rank[0] <= 0 or (previous is not None and rank <= self.preview_rank(scope, previous[0])):
+            return
+        group_id, members = message.getGroupId(), self.cell_group.get(cell)
+        group = None
+        if group_id and members is not None and members.size() > 1:
+            group = self.make_preview_group(group_id, (members.get(i) for i in range(members.size())))
+        if self.allowed(message, group, scope):
+            self.store_preview(scope, checked, retry_at, (message, group))
 
     def after_layout(self, param):
         saved = self.layouts.pop()
@@ -945,10 +1010,17 @@ class AyuFilterDisplayFix(BasePlugin):
 
     def after_cell_attach(self, param):
         cell = param.thisObject
-        self.attached = {key: ref for key, ref in self.attached.items() if ref.get() is not None}
+        if len(self.attached) >= 96:
+            self.attached = {key: ref for key, ref in self.attached.items()
+                             if (attached := ref.get()) is not None and attached.isAttachedToWindow()}
         self.attached[int(self.system.identityHashCode(cell))] = self.weak(cell)
-        if self.preview_key(cell) is not None:
-            run_on_ui_thread(lambda: self.rebuild_cell(cell), 1)
+        key = self.preview_key(cell)
+        if key is not None:
+            checked, retry_at, _ = self.cache.get(key[:2], (None, None, None))
+            if checked != key or (retry_at is not None and retry_at <= monotonic()):
+                self.schedule(cell, key)
+            else:
+                self.track_cell(cell, key)
 
     def rebuild_cell(self, cell):
         if self.active and cell.isAttachedToWindow():
@@ -957,9 +1029,18 @@ class AyuFilterDisplayFix(BasePlugin):
 
     def schedule(self, cell, key):
         self.track_cell(cell, key)
-        if key not in self.running and key not in self.queued:
-            self.queued[key] = None
-            run_on_ui_thread(self.drain_queue, 1)
+        lookup = self.running.get(key)
+        if lookup is not None:
+            lookup.prefetch = False
+        elif self.queued.get(key) is not False:
+            self.queued[key] = False
+            self.queued.move_to_end(key, last=False)
+            self.request_preview_drain()
+
+    def request_preview_drain(self):
+        if not self.preview_drain_pending:
+            self.preview_drain_pending = True
+            run_on_ui_thread(self.drain_queue, 32)
 
     def matching_cells(self, key=None):
         for identity, (ref, previous) in list(self.cells.items()):
@@ -970,13 +1051,87 @@ class AyuFilterDisplayFix(BasePlugin):
                 yield cell
 
     def drain_queue(self):
-        while self.active and self.queued and len(self.running) < 2:
-            key, _ = self.queued.popitem(last=False)
-            if not list(self.matching_cells(key)):
+        self.preview_drain_pending = False
+        for _ in range(4):
+            if not self.active or not self.queued or len(self.running) >= 2:
+                return
+            key, prefetch = next(iter(self.queued.items()))
+            if prefetch and self.running:
+                return
+            del self.queued[key]
+            if not prefetch and not any(True for _ in self.matching_cells(key)):
                 continue
-            lookup = PreviewSearch(self, key)
+            lookup = PreviewSearch(self, key, prefetch)
             self.running[key] = lookup
             lookup.next_page()
+        if self.queued and len(self.running) < 2:
+            self.request_preview_drain()
+
+    def schedule_preview_warm(self, account):
+        now = monotonic()
+        if (not self.active or account in self.preview_warm_accounts
+                or now < self.preview_warm_at.get(account, 0)):
+            return
+        if not (self.ayu.shouldHideFilteredMessages() or self.ayu.shouldHideIgnoredBlockedMessages()):
+            return
+        ticket = self.preview_warm_accounts[account] = object()
+        self.preview_warm_at[account] = now + 3
+        run_on_ui_thread(lambda: self.warm_preview_rows(account, ticket), 480)
+
+    def warm_preview_rows(self, account, ticket):
+        if not self.active or self.preview_warm_accounts.get(account) is not ticket:
+            return
+        controller = self.mc.getInstance(account)
+        instance = self.account_instance.getInstance(account)
+        filters = controller.getDialogFilters()
+        limits = [[filters.get(i), PREVIEW_WARM_ROWS] for i in range(filters.size())]
+        limits.insert(0, [None, PREVIEW_WARM_ROWS])
+        dialogs = controller.getAllDialogs()
+        check_regex = self.ayu.shouldHideFilteredMessages()
+        check_blocked = self.ayu.shouldHideIgnoredBlockedMessages()
+
+        def scan(index):
+            if not self.active or self.preview_warm_accounts.get(account) is not ticket:
+                return
+            stop = min(PREVIEW_WARM_SCAN, dialogs.size())
+            end = min(index + 4, stop)
+            for position in range(index, end):
+                dialog = dialogs.get(position)
+                dialog_id = int(dialog.id)
+                if not dialog.top_message:
+                    continue
+                belongs = False
+                for quota in limits:
+                    folder, remaining = quota
+                    if remaining and (folder is None or folder.includesDialog(instance, dialog_id, dialog)):
+                        quota[1] -= 1
+                        belongs = True
+                if belongs:
+                    self.warm_dialog_preview(account, dialog_id, dialog, controller, check_regex, check_blocked)
+            if end < stop and any(remaining for _, remaining in limits):
+                run_on_ui_thread(lambda: scan(end), 58)
+            else:
+                self.preview_warm_accounts.pop(account, None)
+
+        scan(0)
+
+    def warm_dialog_preview(self, account, dialog_id, dialog, controller, check_regex, check_blocked):
+        group = controller.dialogMessage.get(dialog_id)
+        message = group.get(0) if group is not None and group.size() else None
+        if message is None:
+            return
+        if not ((check_regex and self.ayu.shouldHideFilteredMessage(message, None))
+                or (check_blocked and dialog_id < 0 and self.chat_object.isMegagroup(controller.getChat(-dialog_id))
+                    and self.ayu.isIgnoredBlockedMessage(message))):
+            return
+        key = self.dialog_preview_key(account, dialog_id, dialog, controller)
+        if key is None or key in self.queued or key in self.running:
+            return
+        checked, retry_at, _ = self.cache.get(key[:2], (None, None, None))
+        if checked == key and (retry_at is None or retry_at > monotonic()):
+            return
+        self.queued[key] = True
+        self.request_preview_drain()
 
     def allowed(self, message, group, key):
         account, dialog_id = key[:2]
@@ -991,16 +1146,23 @@ class AyuFilterDisplayFix(BasePlugin):
         primary = group.findPrimaryMessageObject() if group is not None else None
         return not self.ayu.shouldHideFilteredMessage(primary if primary is not None else message, group)
 
-    def clear_previews(self, *, rebind=False):
+    def refresh_previews(self, *, rebind=False, scopes=None, invalid_ids=()):
         if not self.active:
             return
-        self.cache.clear()
-        self.media_cached_lists.clear()
-        self.queued.clear()
-        running = list(self.running.values())
-        self.running.clear()
-        for lookup in running:
-            lookup.cancel()
+        if scopes is None:
+            self.preview_warm_accounts.clear()
+            self.preview_warm_at.clear()
+        for scope, (_, _, candidate) in list(self.cache.items()):
+            if scopes is None or scope in scopes:
+                if candidate is not None and any(member.getId() in invalid_ids for member in self.preview_members(candidate)):
+                    candidate = None
+                self.cache[scope] = None, None, candidate
+        for key in tuple(self.queued):
+            if scopes is None or key[:2] in scopes:
+                self.queued.pop(key)
+        for key in tuple(self.running):
+            if scopes is None or key[:2] in scopes:
+                self.running.pop(key).cancel()
         if rebind:
             for ref in list(self.attached.values()):
                 cell = ref.get()
@@ -1009,11 +1171,30 @@ class AyuFilterDisplayFix(BasePlugin):
                     self.rebuild_cell(cell)
         else:
             for cell in list(self.matching_cells()):
-                self.rebuild_cell(cell)
+                if scopes is None or self.preview_scope(cell) in scopes:
+                    self.rebuild_cell(cell)
 
-    def after_filter_change(self, param):
+    def queue_preview_rule_refresh(self, rebind=False):
+        if self.preview_rules_pending is not None:
+            self.preview_rules_pending |= rebind
+            return
+        self.preview_rules_pending = rebind
+
         def refresh():
-            self.clear_previews()
+            update = self.preview_rules_pending
+            self.preview_rules_pending = None
+            self.refresh_previews(rebind=update)
+
+        run_on_ui_thread(refresh, 1)
+
+    def after_filter_change(self, param, refresh_previews=True):
+        if refresh_previews:
+            self.queue_preview_rule_refresh(rebind=True)
+
+        def refresh():
+            if not self.active:
+                return
+            self.media_cached_lists.clear()
             for ref, _ in self.pinned_chats[:]:
                 chat = ref.get()
                 if chat is not None:
@@ -1031,10 +1212,41 @@ class AyuFilterDisplayFix(BasePlugin):
 
         run_on_ui_thread(refresh, 1)
 
+    def after_preview_edit(self, param):
+        mid, dialog = map(int, param.args)
+
+        def refresh():
+            scopes = {scope for scope, (_, _, candidate) in self.cache.items()
+                      if scope[1] == dialog and (candidate is None
+                          or any(member.getId() == mid for member in self.preview_members(candidate))
+                          or (abs(mid) >= self.preview_rank(scope, candidate[0])[0]))}
+            if scopes:
+                self.refresh_previews(scopes=scopes, invalid_ids={mid})
+
+        run_on_ui_thread(refresh, 1)
+        self.after_filter_change(param, refresh_previews=False)
+
+    def delete_previews(self, account, ids, channel):
+        controller = self.mc.getInstance(account)
+        scopes = {scope for scope, (_, _, candidate) in self.cache.items()
+                  if scope[0] == account and candidate is not None
+                  and any(member.getId() in ids for member in self.preview_members(candidate))
+                  and (scope[1] == -channel if channel else (
+                      scope[1] > 0 or not self.chat_object.isChannel(controller.getChat(-scope[1]))))}
+        if scopes:
+            self.refresh_previews(scopes=scopes, invalid_ids=ids)
+
     def after_dialogs_event(self, param):
-        event = int(param.args[0])
-        if event in (self.filters_changed, self.messages_deleted):
-            run_on_ui_thread(lambda: self.clear_previews(rebind=event == self.filters_changed), 1)
+        event, account, payload = param.args
+        if event == self.filters_changed:
+            self.queue_preview_rule_refresh(rebind=True)
+        elif event in (self.dialogs_loaded, self.dialog_folders_changed):
+            self.schedule_preview_warm(int(account))
+        elif event == self.messages_deleted and len(payload) >= 3 and not payload[2]:
+            ids = payload[0]
+            deleted_ids = {int(ids.get(i)) for i in range(ids.size())}
+            channel = int(payload[1])
+            run_on_ui_thread(lambda: self.delete_previews(int(account), deleted_ids, channel), 1)
 
     def on_plugin_unload(self):
         self.active = False
@@ -1054,6 +1266,7 @@ class AyuFilterDisplayFix(BasePlugin):
                 lookup.cancel()
             self.running.clear()
             self.queued.clear()
+            self.preview_warm_accounts.clear()
             self.cache.clear()
             adapter = self.date_adapter.get() if self.date_adapter else None
             if adapter is not None:
@@ -1070,7 +1283,7 @@ class AyuFilterDisplayFix(BasePlugin):
 
 
 class PreviewSearch:
-    def __init__(self, plugin, key):
+    def __init__(self, plugin, key, prefetch=False):
         self.plugin = plugin
         self.key = key
         self.account, self.dialog_id, self.top, _, _, self.top_group = key
@@ -1082,11 +1295,25 @@ class PreviewSearch:
         self.pages = AlbumPages()
         self.ticket = None
         self.token = 0
+        self.prefetch = prefetch
+        self.prefetch_pages = 2
+
+    def active_scope(self):
+        p = self.plugin
+        if self.prefetch:
+            dialog = self.controller.dialogs_dict.get(self.dialog_id)
+            return p.dialog_preview_key(self.account, self.dialog_id, dialog, self.controller) == self.key
+        return next(iter(p.matching_cells(self.key)), None) is not None
 
     def next_page(self):
         p = self.plugin
         if not p.active or p.running.get(self.key) is not self:
             return
+        if self.prefetch:
+            if self.prefetch_pages <= 0:
+                self.finish(retain=False)
+                return
+            self.prefetch_pages -= 1
         if self.encrypted:
             self.next_secret_page()
             return
@@ -1138,7 +1365,7 @@ class PreviewSearch:
         if ticket is not self.ticket or not p.active:
             return
         self.ticket = None
-        if not list(p.matching_cells(self.key)):
+        if not self.active_scope():
             self.finish(retain=False)
         elif result is None:
             self.finish(retry=True)
@@ -1156,7 +1383,7 @@ class PreviewSearch:
         if ticket is not self.ticket or not p.active:
             return
         self.ticket, self.token = None, 0
-        if not list(p.matching_cells(self.key)):
+        if not self.active_scope():
             self.finish(retain=False)
             return
         if error is not None or response is None or not hasattr(response, "messages"):
@@ -1193,11 +1420,7 @@ class PreviewSearch:
             messages.append(p.message(self.account, raw, False, False))
         group = None
         if raw_messages[0].grouped_id:
-            group = p.album()
-            group.groupId = raw_messages[0].grouped_id
-            for message in messages:
-                group.messages.add(message)
-            group.calculate()
+            group = p.make_preview_group(raw_messages[0].grouped_id, messages)
         if p.allowed(messages[0], group, self.key):
             return messages[0], group
         return None
@@ -1218,12 +1441,17 @@ class PreviewSearch:
         if p.running.get(self.key) is not self:
             return
         del p.running[self.key]
-        if retain:
-            p.cache[self.key] = (monotonic() + (8 if retry else 180), candidate)
-            p.cache.move_to_end(self.key)
-            while len(p.cache) > 96:
-                p.cache.popitem(last=False)
-        if candidate is not None:
-            for cell in list(p.matching_cells(self.key)):
-                p.rebuild_cell(cell)
-        run_on_ui_thread(p.drain_queue, 1)
+        cells = list(p.matching_cells(self.key)) if retain else []
+        if cells or (retain and self.prefetch and self.active_scope()):
+            scope = self.key[:2]
+            _, _, previous = p.cache.get(scope, (None, None, None))
+            if previous is not None and not p.allowed(*previous, scope):
+                previous = None
+            newest = (candidate if candidate is not None and
+                      (previous is None or p.preview_rank(scope, candidate[0]) > p.preview_rank(scope, previous[0]))
+                      else previous)
+            p.store_preview(scope, self.key, monotonic() + 8 if retry else None, newest)
+            if newest is not previous:
+                for cell in cells:
+                    p.rebuild_cell(cell)
+        p.request_preview_drain()

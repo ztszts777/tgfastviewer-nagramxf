@@ -7,7 +7,7 @@ __id__ = "media_sleep_timer"
 __name__ = "媒体播放定时停止"
 __description__ = "音乐工具栏提供独立定时入口，倍速控件避开进度条；视频也支持定时。"
 __author__ = "Codex"
-__version__ = "1.0.10"
+__version__ = "1.0.17"
 __app_version__ = ">=12.10.1"
 
 PRESETS = (15, 30, 45, 60, 90, 120)
@@ -15,7 +15,7 @@ MENU_ID = 65347
 VIDEO_TIMER_CONTROL_TAG = "nagramxf_media_suite.video_timer"
 STATE_ENDED = 4
 WHITE = -1
-VIDEO_SHEET_COLOR = 0xFF1C2229 - (1 << 32)
+VIDEO_SHEET_COLOR = 0xF21C2229 - (1 << 32)
 VIDEO_TIMER_BLUE = 0xFF62AFF5 - (1 << 32)
 AUDIO_TIMER_BLUE = 0xFF216BC2 - (1 << 32)
 AUDIO_ROW_HEIGHT = 48
@@ -73,8 +73,8 @@ class MediaSleepTimer(BasePlugin):
         self.active = True
         self.session = None
         self.waiting = None
-        self.last_minutes = 60
-        self.last_finish = False
+        self.last_minutes = duration_minutes(-1, str(self.get_setting("sleep_timer_minutes", 60))) or 60
+        self.last_finish = bool(self.get_setting("sleep_timer_finish_current", False))
         self.menus = []
         self.audio_rows = []
         self.dialog = None
@@ -130,7 +130,6 @@ class MediaSleepTimer(BasePlugin):
         self.center = jclass("android.widget.ImageView$ScaleType").CENTER
         self.frame_params = jclass("android.widget.FrameLayout$LayoutParams")
         self.linear_params = jclass("android.widget.LinearLayout$LayoutParams")
-        self.round_rect = jclass("android.graphics.drawable.GradientDrawable")
         self.layout_listener = jclass("android.view.View$OnLayoutChangeListener")
         self.theme = jclass("org.telegram.ui.ActionBar.Theme")
         self.dp = jclass("org.telegram.messenger.AndroidUtilities").dp
@@ -234,11 +233,11 @@ class MediaSleepTimer(BasePlugin):
         timer = self.frame_layout(context)
         icon = self.image_view(context)
         icon.setImageResource(self.clock_icon)
-        icon.setScaleType(self.center)
-        timer.addView(icon, self.frame_params(-1, -1, 17))
+        icon.setScaleType(jclass("android.widget.ImageView$ScaleType").FIT_CENTER)
+        timer.addView(icon, self.frame_params(self.dp(22), self.dp(22), 17))
         timer.setContentDescription("定时停止")
         timer.setOnClickListener(OnClickListener(lambda view: self.show_timer(view, None)))
-        toolbar.addView(timer, self.frame_params(self.dp(48), self.dp(48)))
+        toolbar.addView(timer, self.frame_params(self.dp(48), self.dp(56)))
         audio_ref, timer_ref = self.weak(audio), self.weak(timer)
         plugin = self
 
@@ -279,7 +278,7 @@ class MediaSleepTimer(BasePlugin):
             return
         row_width = min(toolbar.getWidth(), self.dp(420))
         inset = (toolbar.getWidth() - row_width) // 2
-        padding = self.dp(14)
+        padding = min(self.dp(14), row_width // 24)
         if not move_speed:
             playback = visible((native[0], *native_playback, timer, native[6]))
         play_index = playback.index(play)
@@ -416,12 +415,11 @@ class MediaSleepTimer(BasePlugin):
             text.setGravity(17)
             text.setMaxLines(1)
             text.setIncludeFontPadding(False)
-            text.setTextSize(11.0)
+            text.setTextSize(12.0)
             if self.sdk >= 26:
-                text.setAutoSizeTextTypeUniformWithConfiguration(8, 11, 1, 2)
+                text.setAutoSizeTextTypeUniformWithConfiguration(10, 12, 1, 2)
             text.setImportantForAccessibility(2)
             params = self.frame_params(-1, self.dp(14), 81)
-            params.bottomMargin = self.dp(1)
             button.addView(text, params)
         text = button.getChildAt(1)
         if text is not None:
@@ -431,7 +429,7 @@ class MediaSleepTimer(BasePlugin):
             if text.getVisibility() != (0 if label else 4):
                 text.setVisibility(0 if label else 4)
         icon.setColorFilter(blue if label else normal)
-        icon.setTranslationY(float(-self.dp(6) if label else 0))
+        icon.setTranslationY(0.0)
         button.setContentDescription(f"定时停止，剩余 {label}" if label else "定时停止")
 
     def render_video_timer(self, item, viewer, label):
@@ -577,45 +575,15 @@ class MediaSleepTimer(BasePlugin):
     def timer_color(self, key, provider):
         return self.theme.getColor(key, provider) if provider is not None else self.theme.getColor(key)
 
-    def make_video_presets(self, context, provider, select):
-        row = self.timer_layout(context)
-        row.setOrientation(0)
-        chips = []
-        for minutes in PRESETS:
-            chip = self.text_view(context)
-            chip.setText(str(minutes))
-            chip.setTextSize(12)
-            chip.setGravity(17)
-            chip.setContentDescription(f"{minutes} 分钟")
-            chip.setOnClickListener(self.timer_click(lambda view, value=minutes: select(value)))
-            params = self.linear_params(0, -1, 1.0)
-            params.leftMargin = params.rightMargin = self.dp(2)
-            row.addView(chip, params)
-            chips.append((minutes, chip))
-
-        def mark(selected):
-            normal = self.timer_color(self.theme.key_dialogTextBlack, provider)
-            for minutes, chip in chips:
-                checked = minutes == selected
-                background = self.round_rect()
-                background.setCornerRadius(float(self.dp(14)))
-                background.setColor(0x3262AFF5 if checked else 0x14FFFFFF)
-                chip.setBackground(background)
-                chip.setTextColor(VIDEO_TIMER_BLUE if checked else normal)
-                chip.setSelected(checked)
-
-        return row, mark
-
     def show_timer_panel(self, anchor, viewer_ref):
         context = self.timer_context(anchor, viewer_ref)
         provider = self.timer_provider(viewer_ref)
         native_sheet = jclass("org.telegram.ui.ActionBar.BottomSheet$Builder")
         timer_setting = jclass("org.telegram.ui.Cells.TextSettingsCell")
         timer_check = jclass("org.telegram.ui.Cells.TextCheckCell")
-        timer_slider = jclass("org.telegram.ui.Components.SlideChooseView")
-        slider_callback = jclass("org.telegram.ui.Components.SlideChooseView$Callback")
         timer_button = jclass("org.telegram.ui.Stories.recorder.ButtonWithCounterView")
-        timer_strings = jarray(jclass("java.lang.String"))
+        scroll_type = jclass("androidx.core.widget.NestedScrollView")
+        layout_listener = jclass("android.view.View$OnLayoutChangeListener")
         root = self.timer_layout(context)
         root.setOrientation(1)
         compact = viewer_ref is not None
@@ -628,52 +596,66 @@ class MediaSleepTimer(BasePlugin):
                 jint(-1), jint(height), jint(51), jint(sides), jint(top), jint(sides), jint(bottom)))
 
         duration = timer_setting(context, provider)
-        duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
+        make_capsule = getattr(self, "make_timer_capsule", None)
+        duration.setTextAndValue("自定义时长", "" if make_capsule else f"{chosen} 分钟", False)
         duration.setBackground(self.theme.createSelectorDrawable(
             self.theme.getColor(self.theme.key_listSelector), 1))
         add(duration, 48)
 
-        slider = None
-        mark = None
+        def timer_choices():
+            return PRESETS if custom is None else (*PRESETS, custom)
 
-        def repaint_slider():
-            if mark is not None:
-                mark(chosen)
-            else:
+        def choose(index):
+            nonlocal chosen
+            values = timer_choices()
+            if 0 <= index < len(values):
+                chosen = values[index]
+                if make_capsule is None:
+                    duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
+
+        if make_capsule is not None:
+            slider_host = self.timer_layout(context)
+            slider_host.setOrientation(1)
+            add(slider_host, -2, 8)
+            palette = None
+            if not compact:
+                primary = self.timer_color(self.theme.key_dialogTextBlack, provider)
+                secondary = self.timer_color(self.theme.key_dialogTextGray2, provider)
+                accent = self.audio_timer_blue()
+                palette = (primary, secondary, accent, (primary & 0xFFFFFF) | 0x24000000, WHITE)
+
+            def repaint_slider():
+                values = timer_choices()
+                positions = tuple(i / (len(values) - 1) for i in range(len(values)))
+                labels = tuple(str(value) for value in PRESETS) + (("自定义",) if custom is not None else ())
+                slider_host.removeAllViews()
+                slider = make_capsule(context, "时长", positions, labels, positions[values.index(chosen)],
+                                      None, lambda _, __, point: choose(point), palette=palette,
+                                      value_labels=tuple(f"{value} 分钟" for value in values))
+                slider_host.addView(slider, self.linear_params(-1, -2))
+        else:
+            timer_slider = jclass("org.telegram.ui.Components.SlideChooseView")
+            slider_callback = jclass("org.telegram.ui.Components.SlideChooseView$Callback")
+            timer_strings = jarray(jclass("java.lang.String"))
+            slider = timer_slider(context, provider)
+
+            class SliderCallback(dynamic_proxy(slider_callback)):
+                def onOptionSelected(self, index):
+                    choose(index)
+
+                def onTouchEnd(self):
+                    pass
+
+            def repaint_slider():
                 labels = [str(value) for value in PRESETS]
                 if custom is not None:
                     labels.append("自定义")
-                selection = PRESETS.index(chosen) if chosen in PRESETS else len(PRESETS)
-                slider.setOptions(selection, timer_strings(labels))
-            duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
-
-        def select(minutes):
-            nonlocal chosen
-            chosen = minutes
-            repaint_slider()
-
-        class SliderCallback(dynamic_proxy(slider_callback)):
-            def onOptionSelected(self, index):
-                nonlocal chosen
-                if 0 <= index < len(PRESETS):
-                    chosen = PRESETS[index]
-                elif index == len(PRESETS) and custom is not None:
-                    chosen = custom
-                else:
-                    return
+                slider.setOptions(timer_choices().index(chosen), timer_strings(labels))
                 duration.setTextAndValue("自定义时长", f"{chosen} 分钟", False)
 
-            def onTouchEnd(self):
-                pass
-
-        if compact:
-            presets, mark = self.make_video_presets(context, provider, select)
-            add(presets, 38, 14, 0, 2)
-        else:
-            slider = timer_slider(context, provider)
             slider.setCallback(SliderCallback())
             slider.setContentDescription("睡眠定时时长")
-            add(slider, 72)
+            add(slider, 74)
         repaint_slider()
 
         finish = timer_check(context, provider)
@@ -730,9 +712,18 @@ class MediaSleepTimer(BasePlugin):
         builder = (native_sheet(context, False, provider, VIDEO_SHEET_COLOR)
                    if provider is not None else native_sheet(context))
         builder.setTitle("睡眠定时")
-        builder.setCustomView(root)
+        scroll = scroll_type(context)
+        scroll.setVerticalScrollBarEnabled(False)
+        scroll.addView(root, jclass("android.widget.FrameLayout$LayoutParams")(-1, -2))
+        builder.setCustomView(scroll)
         sheet = builder.create()
         sheet.scrollNavBar = True
+
+        class SheetLayoutListener(dynamic_proxy(layout_listener)):
+            def onLayoutChange(self, view, left, top, right, bottom, old_left, old_top, old_right, old_bottom):
+                sheet.setCanDismissWithSwipe(root.getMeasuredHeight() <= bottom - top)
+
+        scroll.addOnLayoutChangeListener(SheetLayoutListener())
         sheet.show()
         if not sheet.isShowing():
             raise RuntimeError("Nagram did not show the bottom sheet")
@@ -860,6 +851,8 @@ class MediaSleepTimer(BasePlugin):
     def start_timer(self, minutes, finish, viewer_ref):
         self.clear()
         self.last_minutes, self.last_finish = minutes, finish
+        self.set_setting("sleep_timer_minutes", minutes)
+        self.set_setting("sleep_timer_finish_current", finish)
         self.session = (self.clock.elapsedRealtime() + minutes * 60000, finish, viewer_ref)
         self.tick()
 
