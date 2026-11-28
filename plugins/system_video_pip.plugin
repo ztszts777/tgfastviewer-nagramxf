@@ -9,7 +9,7 @@ __id__ = "system_video_pip"
 __name__ = "系统视频小窗和播控"
 __description__ = "让普通视频使用 Android 画中画，并同步标题、封面和播放状态到系统播控。"
 __author__ = "Codex"
-__version__ = "1.0.19"
+__version__ = "1.1.0"
 __app_version__ = ">=12.10.1"
 
 LEGACY_NOTIFICATION_ID = 65027
@@ -22,6 +22,8 @@ BACK = 2
 FORWARD = 3
 STOP_AUDIO = 4
 BACKGROUND_AUDIO_ITEM = 65348
+AUTOPLAY_VIDEO_ITEM = 65349
+VIDEO_PLAY_CONTINUOUS, VIDEO_PLAY_LOOP, VIDEO_PLAY_STOP = range(3)
 BACKGROUND_AUDIO_BLUE = 0xFF62AFF5 - (1 << 32)
 MUSIC_NOTIFICATION_ID = 5
 IN_APP_AUDIO_STYLE = 0  # FragmentContextView.STYLE_AUDIO_PLAYER
@@ -182,6 +184,12 @@ class SystemVideoPip(BasePlugin):
         self.background_session_activity = None
         self.detached_background_viewer = None
         self.background_items = []
+        self.autoplay_items = []
+        self.playback_mode_items = []
+        self.playback_mode_params = jclass("android.widget.LinearLayout$LayoutParams")
+        self.autoplay_enabled = bool(self.get_setting("video_autoplay_enabled", False))
+        self.autoplay_pending = None
+        self.loop_override = None
         if self.sdk < 26:
             return
         application = jclass("org.telegram.messenger.ApplicationLoader").applicationContext
@@ -251,14 +259,17 @@ class SystemVideoPip(BasePlugin):
             return resources.getIdentifier("cast_ic_notification_" + name, "drawable", package_name) or fallback
 
         # These four monochrome Cast drawables use the same 24 dp icon set.
-        self.seek_actions = (
-            (BACK, "后退 15 秒", media_icon("rewind", drawables.ic_media_rew)),
-            (FORWARD, "前进 15 秒", media_icon("forward", drawables.ic_media_ff)),
-        )
+        self.seek_icons = (media_icon("rewind", drawables.ic_media_rew),
+                           media_icon("forward", drawables.ic_media_ff))
+        self.set_seek_labels()
         self.play_icon = media_icon("play", drawables.ic_media_play)
         self.pause_icon = media_icon("pause", drawables.ic_media_pause)
         self.notification_icon = drawables.ic_media_play
-        self.headphone_icon = jclass("org.telegram.messenger.R$drawable").msg_voice_headphones
+        app_icons = jclass("org.telegram.messenger.R$drawable")
+        self.headphone_icon = app_icons.msg_voice_headphones
+        self.autoplay_icon = (resources.getIdentifier("msg_playlist", "drawable", package_name)
+                              or resources.getIdentifier("msg_playnext", "drawable", package_name)
+                              or self.play_icon)
         self.stop_icon = media_icon("stop_live_stream", self.headphone_icon)
         self.icon = jclass("android.graphics.drawable.Icon")
         self.intent = jclass("android.content.Intent")
@@ -280,7 +291,7 @@ class SystemVideoPip(BasePlugin):
         self.prepare_video = method(self.viewer_type, "preparePlayer", 7)
         self.hooks.append(self.hook_method(self.prepare_video, before=self.before_background_return,
                                            after=self.after_player_ready))
-        self.bind(self.viewer_type, "updatePlayerState", 2, after=self.after_player_ready)
+        self.bind(self.viewer_type, "updatePlayerState", 2, after=self.after_viewer_player_state)
         self.bind(self.viewer_type, "didReceivedNotification", 3, after=self.after_video_media_loaded)
         video_type = jclass("org.telegram.ui.Components.VideoPlayer").getClass()
         self.bind(video_type, "onRenderedFirstFrame", 0, after=self.after_cover_frame)
@@ -289,6 +300,7 @@ class SystemVideoPip(BasePlugin):
         self.bind(self.viewer_type, "onPause", 0, before=self.before_viewer_pause)
         self.bind(self.viewer_type, "onResume", 0, after=lambda param: self.clear_pause_state(param.thisObject))
         self.bind(self.viewer_type, "onPhotoClosed", 1, before=self.before_viewer_closed)
+        self.bind(self.viewer_type, "closePhoto", 2, before=self.remember_background_playback)
         self.bind(self.viewer_type, "releasePlayer", 1, before=self.before_viewer_release)
         self.bind(self.viewer_type, "setImageIndex", 4, after=self.after_background_index)
         self.bind(self.viewer_type, "pipIsAvailable", 0, after=self.retain_paused_card)
@@ -313,7 +325,30 @@ class SystemVideoPip(BasePlugin):
         self.hooks.append(self.hook_method(method(owner, name, arity), **callbacks))
 
     def option(self, key):
-        return getattr(self, "flags", {}).get(key, True)
+        return getattr(self, "flags", {}).get(key, key != "video_autoplay")
+
+    def set_seek_labels(self):
+        self.seek_actions = ((BACK, "后退 15 秒", self.seek_icons[0]),
+                             (FORWARD, "前进 15 秒", self.seek_icons[1]))
+
+    def refresh_language(self):
+        if not self.active:
+            return
+        self.set_seek_labels()
+        for entries, label in ((self.background_items, "后台听视频"), (self.autoplay_items, "连续播放")):
+            for _, row_ref in entries:
+                row = row_ref.get()
+                if row is not None:
+                    row.setText(label)
+        modes, self.playback_mode_items = getattr(self, "playback_mode_items", []), []
+        for entry in modes:
+            self.restore_playback_mode_item(entry)
+            viewer = entry[4].get()
+            if viewer is not None and viewer.isVisible():
+                self.update_autoplay_item(viewer)
+        audio = self.current_background()
+        if audio is not None:
+            self.ensure_background_notification(audio)
 
     def transport_buttons(self, playing):
         back, forward = self.seek_actions
@@ -408,6 +443,17 @@ class SystemVideoPip(BasePlugin):
         self.visual_service_action = self.application.getPackageName() + ".video-playback-card"
         self.open_background_action = self.application.getPackageName() + ".open-background-video."
         self.shared_config = jclass("org.telegram.messenger.SharedConfig")
+        self.file_loader = jclass("org.telegram.messenger.FileLoader")
+        self.file = jclass("java.io.File")
+        self.uri = jclass("android.net.Uri")
+        self.video_type = jclass("org.telegram.ui.Components.VideoPlayer")
+        self.video_uri = jclass("org.telegram.ui.Components.VideoPlayer$VideoUri")
+        self.video_index = method(self.viewer_type, "setImageIndex", 4)
+        self.video_action = method(self.viewer_type, "onActionClick", 1)
+        self.video_file_names = field(self.viewer_type, "currentFileNames")
+        self.viewer_looping = field(self.viewer_type, "playerLooping")
+        self.viewer_manual_pause = field(self.viewer_type, "manuallyPaused")
+        self.bind(self.video_type.getClass(), "saveLooping", 2, before=self.before_save_looping)
         self.bind(self.launch, "handleIntentInternal", 7, before=self.before_background_intent)
         self.bind(self.launch, "onResume", 0, after=self.after_background_resume)
         self.bind(self.music_service, "onCreate", 0, after=self.after_music_create)
@@ -447,7 +493,8 @@ class SystemVideoPip(BasePlugin):
         self.bind(controller, "setTextureView", 5, before=self.before_background_video_attachment)
         self.bind(video_player, "onSurfaceDestroyed", 1, before=self.before_background_surface_destroyed)
         self.loop_item = field(self.viewer_type, "loopItem")
-        self.bind(controller, "updateVideoState", 5, after=self.after_background_player_state)
+        self.bind(controller, "updateVideoState", 5, before=self.before_background_player_state,
+                  after=self.after_background_player_state)
         self.bind(controller, "playMessage", 2, after=self.after_native_music_play)
         playback_bar = jclass("org.telegram.ui.Components.FragmentContextView").getClass()
         self.in_app_title_view = field(playback_bar, "titleTextView")
@@ -641,13 +688,13 @@ class SystemVideoPip(BasePlugin):
                 row = row_ref.get()
                 row.setVisibility(0 if show else 8)
                 if show:
-                    self.place_background_item(viewer, row)
+                    self.place_video_item_by_loop(viewer, row, below=True)
                     self.style_background_item(row, self.background_armed(viewer))
                 return
         if not show:
             return
         row = menu.addSubItem(BACKGROUND_AUDIO_ITEM, self.headphone_icon, "后台听视频")
-        self.place_background_item(viewer, row)
+        self.place_video_item_by_loop(viewer, row, below=True)
         self.style_background_item(row, self.background_armed(viewer))
         row.setSelectorColor(0x0FFFFFFF)
         viewer_ref = self.weak(viewer)
@@ -659,21 +706,207 @@ class SystemVideoPip(BasePlugin):
         row.setOnClickListener(OnClickListener(listen))
         self.background_items.append((self.weak(menu), self.weak(row)))
 
-    def place_background_item(self, viewer, row):
+    def place_video_item_by_loop(self, viewer, row, *, below):
         loop = self.loop_item.get(viewer)
         parent = loop.getParent() if loop is not None else None
         if parent is None or row.getParent() != parent:
             return
         old, index = parent.indexOfChild(row), parent.indexOfChild(loop)
-        if old != index + 1:
+        destination = index + int(below) - int(old < index)
+        if old != destination:
             params = row.getLayoutParams()
             parent.removeView(row)
-            parent.addView(row, index + (0 if old < index else 1), params)
+            parent.addView(row, destination, params)
 
     def style_background_item(self, row, enabled):
         color = BACKGROUND_AUDIO_BLUE if enabled else -1
         row.setColors(color, color)
         row.setSelected(enabled)
+
+    def update_autoplay_item(self, viewer):
+        menu = self.video_settings.get(viewer)
+        if menu is None:
+            return
+        message = viewer.getCurrentMessageObject()
+        show = (self.option("video_autoplay") and message is not None and message.isVideo()
+                and self.ordinary_video(viewer))
+        if getattr(self, "make_playback_mode_capsule", None) is not None:
+            self.update_playback_mode_item(viewer, show)
+            return
+        self.autoplay_items = [(m, r) for m, r in self.autoplay_items if r.get() is not None]
+        row = next((r.get() for m, r in self.autoplay_items if m.get() == menu), None)
+        if show and row is None:
+            row = menu.addSubItem(AUTOPLAY_VIDEO_ITEM, self.autoplay_icon, "连续播放")
+            row.setSelectorColor(0x0FFFFFFF)
+            viewer_ref = self.weak(viewer)
+
+            def toggle(_):
+                menu.closeSubMenu()
+                current = viewer_ref.get()
+                if current is not None and current.isVisible():
+                    self.set_autoplay(not self.autoplay_enabled)
+                    self.sync_autoplay_loop(current)
+                    self.update_autoplay_item(current)
+
+            row.setOnClickListener(OnClickListener(toggle))
+            self.autoplay_items.append((self.weak(menu), self.weak(row)))
+        if row is not None:
+            row.setVisibility(0 if show else 8)
+            if show:
+                self.place_video_item_by_loop(viewer, row, below=False)
+                self.style_background_item(row, self.autoplay_enabled)
+
+    def update_playback_mode_item(self, viewer, show):
+        loop = self.loop_item.get(viewer)
+        if loop is None:
+            return
+        parent = loop.getParent()
+        self.playback_mode_items = [entry for entry in self.playback_mode_items if entry[0].get() is not None]
+        saved = next((entry for entry in self.playback_mode_items if entry[0].get() == loop), None)
+        selected = self.video_playback_mode(viewer)
+        if saved is not None:
+            current = saved[1].get()
+            if show and saved[3] == selected and current is not None and current.getParent() == parent:
+                return
+            self.restore_playback_mode_item(saved)
+            self.playback_mode_items.remove(saved)
+        if not show or parent is None:
+            return
+        viewer_ref = self.weak(viewer)
+
+        def select(mode):
+            owner = viewer_ref.get()
+            if self.active and owner is not None and owner.isVisible():
+                self.select_video_playback_mode(owner, mode)
+
+        row = self.make_playback_mode_capsule(loop.getContext(), selected, select)
+        parent.addView(row, parent.indexOfChild(loop), self.playback_mode_params(-1, -2))
+        self.playback_mode_items.append((self.weak(loop), self.weak(row), loop.getVisibility(), selected, viewer_ref))
+        loop.setVisibility(8)
+
+    def restore_playback_mode_item(self, entry):
+        loop, row = entry[0].get(), entry[1].get()
+        if row is not None and row.getParent() is not None:
+            row.getParent().removeView(row)
+        if loop is not None:
+            loop.setVisibility(entry[2])
+
+    def video_playback_mode(self, viewer):
+        if self.option("video_autoplay") and self.autoplay_enabled:
+            return VIDEO_PLAY_CONTINUOUS
+        return VIDEO_PLAY_LOOP if self.viewer_looping.getBoolean(viewer) else VIDEO_PLAY_STOP
+
+    def select_video_playback_mode(self, viewer, mode):
+        if mode == VIDEO_PLAY_CONTINUOUS:
+            self.set_autoplay(True)
+            self.sync_autoplay_loop(viewer)
+            return
+        self.set_autoplay(False)
+        self.loop_override = None
+        enabled = mode == VIDEO_PLAY_LOOP
+        self.video_type.saveLooping(enabled, viewer.getCurrentMessageObject())
+        self.apply_loop_state(viewer, viewer.getVideoPlayer(), enabled)
+
+    def set_autoplay(self, enabled):
+        if self.autoplay_enabled != enabled:
+            self.autoplay_enabled = enabled
+            self.set_setting("video_autoplay_enabled", enabled)
+
+    def sync_autoplay_loop(self, viewer):
+        player = viewer.getVideoPlayer()
+        message = viewer.getCurrentMessageObject()
+        if player is None or message is None or not self.ordinary_video(viewer):
+            return
+        key = message_key(message)
+        enabled = self.option("video_autoplay") and self.autoplay_enabled
+        saved = self.loop_override
+        if enabled:
+            if self.viewer_looping.getBoolean(viewer):
+                self.loop_override = self.weak(viewer), player, key
+                self.apply_loop_state(viewer, player, False)
+        elif saved is not None and saved[0].get() == viewer:
+            self.loop_override = None
+            if saved[1:] == (player, key):
+                self.apply_loop_state(viewer, player, True)
+
+    def apply_loop_state(self, viewer, player, enabled):
+        self.viewer_looping.setBoolean(viewer, enabled)
+        if player is not None:
+            player.setLooping(enabled)
+        row = self.loop_item.get(viewer)
+        if row is not None:
+            row.setEnabledByColor(enabled, -1, 0xFF73B4EC - (1 << 32))
+            row.setSelectorColor(0x0F73B4EC if enabled else 0x0FFFFFFF)
+
+    def before_save_looping(self, param):
+        if not self.autoplay_enabled or not self.option("video_autoplay") or not param.args[0]:
+            return
+        saved = self.loop_override
+        self.loop_override = None  # Nagram is about to enable looping itself.
+        self.set_autoplay(False)
+        if saved is not None and saved[0].get() is not None:
+            self.update_autoplay_item(saved[0].get())
+
+    def next_viewer_video(self, viewer, index):
+        messages = self.viewer_media.get(viewer)
+        current = viewer.getCurrentMessageObject()
+        if messages is None or current is None or not 0 <= index < messages.size():
+            return None
+        listed = messages.get(index)
+        if listed is None or message_key(listed) != message_key(current):
+            return None
+        for next_index in range(index + 1, messages.size()):
+            message = messages.get(next_index)
+            if (message is not None and message.isVideo() and message.getDocument() is not None
+                    and message_key(message)[:2] == message_key(current)[:2]):
+                yield next_index, message
+
+    def allow_autoplay(self, player):
+        return (self.active and self.option("video_autoplay") and self.autoplay_enabled
+                and player is not None and not player.isLooping()
+                and not getattr(self, "autoplay_timer_due", lambda _: False)(player))
+
+    def after_viewer_player_state(self, param):
+        viewer = param.thisObject
+        if int(param.args[1]) == STATE_ENDED and param.args[0] and self.autoplay_pending is None:
+            player = viewer.getVideoPlayer()
+            if self.allow_autoplay(player) and viewer.isVisible() and self.ordinary_video(viewer):
+                index = viewer.getCurrentIndex()
+                current = viewer.getCurrentMessageObject()
+                if current is not None and next(self.next_viewer_video(viewer, index), None) is not None:
+                    ended_key = message_key(current)
+                    self.autoplay_pending = token = object()
+
+                    def advance():
+                        if self.autoplay_pending is not token:
+                            return
+                        self.autoplay_pending = None
+                        current = viewer.getCurrentMessageObject()
+                        if (not self.allow_autoplay(player) or not viewer.isVisible()
+                                or viewer.getVideoPlayer() != player or current is None
+                                or message_key(current) != ended_key):
+                            return
+                        selected = next(self.next_viewer_video(viewer, viewer.getCurrentIndex()), None)
+                        if selected is None:
+                            return
+                        new_index, message = selected
+                        self.video_index.invoke(viewer, self.object_args([
+                            self.java_integer(new_index), self.java_boolean(False), self.java_boolean(True),
+                            self.java_boolean(False),
+                        ]))
+                        current = viewer.getCurrentMessageObject()
+                        if current is not None and message_key(current) == message_key(message):
+                            self.viewer_manual_pause.setBoolean(viewer, False)
+                            next_player = viewer.getVideoPlayer()
+                            if next_player is not None and next_player != player:
+                                next_player.play()
+                            elif next_player is None:
+                                name = self.video_file_names.get(viewer)[0]
+                                loading = name is not None and self.file_loader.getInstance(message.currentAccount).isLoadingFile(name)
+                                self.video_action.invoke(viewer, self.object_args([self.java_boolean(not loading)]))
+
+                    run_on_ui_thread(advance, 1)
+        self.after_player_ready(param)
 
     def background_armed(self, viewer):
         choice = self.background_choice
@@ -743,10 +976,14 @@ class SystemVideoPip(BasePlugin):
         viewer = param.thisObject
         self.sync_background_choice(viewer)
         self.update_background_item(viewer)
+        self.update_autoplay_item(viewer)
 
     def before_viewer_pause(self, param):
+        self.remember_background_playback(param)
+
+    def remember_background_playback(self, param):
         viewer = param.thisObject
-        if self.background_armed(viewer):
+        if self.active and self.background_armed(viewer):
             player = viewer.getVideoPlayer()
             if player is not None and player.player is not None:
                 self.background_before_pause = (self.weak(viewer), player, is_playing(player.player))
@@ -787,7 +1024,14 @@ class SystemVideoPip(BasePlugin):
         activity = viewer.getParentActivity()
         player = viewer.getVideoPlayer()
         engine = player.player
-        resume = is_playing(engine) if resume is None else resume
+        paused = self.background_before_pause
+        if resume is None:
+            if not pip_closed and paused is not None and paused[0].get() == viewer and paused[1] == player:
+                resume = paused[2]
+            else:
+                resume = is_playing(engine)
+        if not resume:
+            player.pause()
         volume = player.getVolume()
         audio = None
         selector = original = audio_only = None
@@ -1076,6 +1320,97 @@ class SystemVideoPip(BasePlugin):
         if audio is not None and audio.player == param.thisObject:
             param.setResult(False)
 
+    def before_background_player_state(self, param):
+        if int(param.args[4]) != STATE_ENDED or not param.args[3]:
+            return
+        audio = self.current_background()
+        if (audio is None or audio.playback_message != param.args[0] or not audio.queue
+                or not self.allow_autoplay(audio.player) or self.media.isMessagePaused()):
+            return
+        queue = audio.queue
+        if self.autoplay_pending is queue:
+            param.setResult(None)
+            return
+        self.autoplay_pending = queue
+        param.setResult(None)  # Keep the shared media session while the next source is prepared.
+
+        def advance():
+            if self.autoplay_pending is not queue:
+                return
+            self.autoplay_pending = None
+            if self.current_background() is not audio or self.media.isMessagePaused():
+                return
+            if self.allow_autoplay(audio.player):
+                for index, message in enumerate(queue):
+                    try:
+                        uri = self.background_video_uri(message)
+                        if uri is not None:
+                            self.advance_background_video(audio, message, uri, queue[index + 1:])
+                            return
+                    except Exception as error:
+                        self.log(f"Could not play the next background video: {type(error).__name__}: {error}")
+                        break
+            self.stop_background()
+
+        run_on_ui_thread(advance, 1)
+
+    def background_video_uri(self, message):
+        raw = message.messageOwner
+        if (raw is None or raw.noforwards or 0 < raw.ttl < 3600 or message.hasRevealedExtendedMedia()
+                or message.isRestrictedMessage or message.isHiddenSensitive()
+                or message.hasMediaSpoilers()):
+            return None
+        loader = self.file_loader.getInstance(message.currentAccount)
+        if raw.attachPath:
+            file = self.file(raw.attachPath)
+            if file.exists():
+                return self.uri.fromFile(file)
+        file = loader.getPathToMessage(raw)
+        if file is not None and file.exists():
+            return self.uri.fromFile(file)
+        if self.shared_config.streamMedia and message.canStreamVideo() and not message.shouldEncryptPhotoOrVideo():
+            return self.video_uri.getUri(message.currentAccount, message.getDocument(), loader.getFileReference(message))
+        return None
+
+    def advance_background_video(self, audio, message, uri, remaining):
+        title = self.video_queue_title(message, audio)
+        artist = self.video_artist(message)
+        playback = self.make_background_message(message, title, artist)
+        old = audio.player
+        player = self.video_type()
+        injected = False
+        try:
+            selector = self.track_selector.get(player)
+            tracks = selector.getParameters()
+            selector.setParameters(tracks.buildUpon().setTrackTypeDisabled(2, True).build())
+            self.media.injectVideoPlayer(player, playback)
+            injected = True
+            audio.message, audio.player, audio.playback_message = message, player, playback
+            audio.uri, audio.qualities, audio.track_selection = uri, None, tracks
+            audio.title, audio.artist, audio.queue, audio.cover = title, artist, remaining, None
+            player.preparePlayer(uri, "other")
+            player.setVolume(old.getVolume())
+            player.setPlaybackSpeed(old.getPlaybackSpeed())
+            player.play()
+            self.ensure_background_notification(audio)
+        except Exception:
+            if not injected:
+                player.releasePlayer(True)
+            raise
+        finally:
+            if injected:
+                old.releasePlayer(True)
+
+    def video_queue_title(self, message, audio):
+        title, group = video_caption_title(message), message.getGroupId()
+        if not title and group:
+            if audio.message.getGroupId() == group:
+                return audio.title
+            for item in audio.queue:
+                if item.getGroupId() == group and (title := video_caption_title(item)):
+                    break
+        return title or media_title(None, message.getDocumentName())
+
     def after_background_player_state(self, param):
         audio = self.current_background()
         activity = audio.activity.get() if audio is not None else None
@@ -1227,6 +1562,8 @@ class SystemVideoPip(BasePlugin):
             return
         self.sync_background_choice(viewer)
         self.update_background_item(viewer)
+        self.sync_autoplay_loop(viewer)
+        self.update_autoplay_item(viewer)
         if self.background is not None and viewer.getVideoPlayer() == self.background.player:
             return
         if (not (self.option("system_pip") or self.option("media_controls"))
@@ -1427,11 +1764,22 @@ class SystemVideoPip(BasePlugin):
                 self.refresh_auto_pip(viewer)
             self.stop_background()
             self.drop_card()
-            for _, row_ref in self.background_items:
+            loop = getattr(self, "loop_override", None)
+            self.loop_override = None
+            if loop is not None:
+                owner = loop[0].get()
+                message = owner.getCurrentMessageObject() if owner is not None else None
+                if message is not None and (owner.getVideoPlayer(), message_key(message)) == loop[1:]:
+                    self.apply_loop_state(owner, loop[1], True)
+            for _, row_ref in (*self.background_items, *self.autoplay_items):
                 row = row_ref.get()
                 if row is not None and row.getParent() is not None:
                     row.getParent().removeView(row)
             self.background_items.clear()
+            self.autoplay_items.clear()
+            for entry in self.playback_mode_items:
+                self.restore_playback_mode_item(entry)
+            self.playback_mode_items.clear()
             for viewer_ref, source_ref in self.owned_sources:
                 viewer, source = viewer_ref.get(), source_ref.get()
                 if viewer is not None and source is not None and self.source.get(viewer) == source:
@@ -1449,6 +1797,8 @@ class BackgroundAudio:
         self.message = message
         self.player = player
         self.track_selection = original_tracks
+        self.queue = (tuple(item for _, item in plugin.next_viewer_video(viewer, viewer.getCurrentIndex()))
+                      if plugin.option("video_autoplay") and plugin.autoplay_enabled else ())
         self.uri = plugin.viewer_video_uri.get(viewer)
         self.qualities = plugin.viewer_video_qualities.get(viewer)
         self.dialogs = (plugin.viewer_dialog_id.getLong(viewer), plugin.viewer_merge_id.getLong(viewer),

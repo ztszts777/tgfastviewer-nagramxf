@@ -1,13 +1,13 @@
 from android_utils import OnClickListener, R, run_on_ui_thread
 from base_plugin import BasePlugin
-from java import dynamic_proxy, jarray, jclass, jint
+from java import cast, dynamic_proxy, jarray, jclass, jint
 
 
 __id__ = "media_sleep_timer"
 __name__ = "媒体播放定时停止"
 __description__ = "音乐工具栏提供独立定时入口，倍速控件避开进度条；视频也支持定时。"
 __author__ = "Codex"
-__version__ = "1.0.17"
+__version__ = "1.0.21"
 __app_version__ = ">=12.10.1"
 
 PRESETS = (15, 30, 45, 60, 90, 120)
@@ -19,6 +19,7 @@ VIDEO_SHEET_COLOR = 0xF21C2229 - (1 << 32)
 VIDEO_TIMER_BLUE = 0xFF62AFF5 - (1 << 32)
 AUDIO_TIMER_BLUE = 0xFF216BC2 - (1 << 32)
 AUDIO_ROW_HEIGHT = 48
+AUDIO_SHOW_IN_CHAT_TAG = "nagramxf_media_suite.audio_show_in_chat"
 
 
 def resolve_method(owner, name, arity):
@@ -77,6 +78,8 @@ class MediaSleepTimer(BasePlugin):
         self.last_finish = bool(self.get_setting("sleep_timer_finish_current", False))
         self.menus = []
         self.audio_rows = []
+        self.mini_audio_bars = []
+        self.audio_options_stack = []
         self.dialog = None
         self.dialog_is_sheet = False
         self.editor_dialog = None
@@ -108,6 +111,7 @@ class MediaSleepTimer(BasePlugin):
         self.toast = jclass("android.widget.Toast")
         drawables = jclass("org.telegram.messenger.R$drawable")
         self.clock_icon = drawables.msg_timer
+        self.audio_eye_icon, self.audio_menu_chat_icon = drawables.msg_views, drawables.msg_message
         self.track_icons = (drawables.baseline_skip_previous_24_white, drawables.baseline_skip_next_24_white)
         self.audio_native_buttons = resolve_field(audio_ui, "buttons")
         self.audio_layout = resolve_field(audio_ui, "playerLayout")
@@ -120,7 +124,9 @@ class MediaSleepTimer(BasePlugin):
         self.audio_noforwards = resolve_field(audio_ui, "noforwards")
         self.audio_my_list = resolve_method(audio_ui, "isMyList", 0)
         self.audio_update_title = resolve_method(audio_ui, "updateTitle", 1)
+        self.audio_show_in_chat = resolve_method(audio_ui, "onSubItemClick", 1)
         self.object_args = jarray(jclass("java.lang.Object"))
+        self.audio_show_in_chat_args = self.object_args([jclass("java.lang.Integer")(4)])
         self.boolean = jclass("java.lang.Boolean")
         self.image_view = jclass("android.widget.ImageView")
         self.text_view = jclass("android.widget.TextView")
@@ -147,6 +153,17 @@ class MediaSleepTimer(BasePlugin):
         self.bind(audio_ui, "updateColors", 0, after=self.after_audio_colors)
         self.bind(audio_ui, "updateTitle", 1, after=self.after_audio_title)
         self.bind(audio_ui, "setVisibleInProfile", 1, before=self.before_audio_profile)
+        self.bind(audio_ui, "showMenuOptions", 1, before=self.before_audio_options,
+                  after=lambda _: self.audio_options_stack.pop())
+        mini_player = jclass("org.telegram.ui.Components.FragmentContextView").getClass()
+        self.mini_audio_speed = resolve_field(mini_player, "playbackSpeedButton")
+        self.mini_audio_title = resolve_field(mini_player, "titleTextView")
+        self.mini_audio_join_width = resolve_field(mini_player, "joinButtonWidth")
+        self.mini_audio_message = resolve_field(mini_player, "lastMessageObject")
+        self.mini_audio_update_speed = resolve_method(mini_player, "updatePlaybackButton", 1)
+        self.bind(mini_player, "checkPlayer", 1, after=self.after_mini_audio_player)
+        item_options = jclass("org.telegram.ui.Components.ItemOptions").getClass()
+        self.bind(item_options, "addIf", 4, before=self.hide_audio_chat_menu_item)
         self.bind(video_player, "maybeReportPlayerState", 0,
                   before=self.before_player_state, after=self.after_player_state)
         self.bind(video_player, "onPositionDiscontinuity", 3, before=self.before_repeat)
@@ -235,10 +252,19 @@ class MediaSleepTimer(BasePlugin):
         icon.setImageResource(self.clock_icon)
         icon.setScaleType(jclass("android.widget.ImageView$ScaleType").FIT_CENTER)
         timer.addView(icon, self.frame_params(self.dp(22), self.dp(22), 17))
+        self.add_timer_countdown(timer, height=16, min_sp=8)
         timer.setContentDescription("定时停止")
         timer.setOnClickListener(OnClickListener(lambda view: self.show_timer(view, None)))
-        toolbar.addView(timer, self.frame_params(self.dp(48), self.dp(56)))
+        toolbar.addView(timer, self.frame_params(self.dp(56), self.dp(56)))
         audio_ref, timer_ref = self.weak(audio), self.weak(timer)
+        eye = self.image_view(context)
+        eye.setTag(AUDIO_SHOW_IN_CHAT_TAG)
+        eye.setContentDescription("在聊天中查看")
+        eye.setImageResource(self.audio_eye_icon)
+        eye.setScaleType(self.center)
+        eye.setVisibility(8)
+        eye.setOnClickListener(OnClickListener(lambda _: self.open_audio_in_chat(audio_ref)))
+        toolbar.addView(eye, self.frame_params(self.dp(48), self.dp(48)))
         plugin = self
 
         class LayoutListener(dynamic_proxy(self.layout_listener)):
@@ -252,7 +278,60 @@ class MediaSleepTimer(BasePlugin):
         player_layout.addOnLayoutChangeListener(listener)
         self.audio_rows.append((audio_ref, timer_ref, listener))
         self.color_audio_clock(audio, timer)
+        self.color_audio_eye(audio, eye)
         self.update_audio_footer(audio)
+
+    def open_audio_in_chat(self, audio_ref):
+        audio = audio_ref.get()
+        message = self.controller.getPlayingMessageObject()
+        if audio is not None and message is not None and message.getId() > 0:
+            self.audio_show_in_chat.invoke(audio, self.audio_show_in_chat_args)
+
+    def before_audio_options(self, param):
+        native = self.audio_native_buttons.get(param.thisObject)
+        toolbar = native[6].getParent() if native is not None and native[6] is not None else None
+        eye = toolbar.findViewWithTag(AUDIO_SHOW_IN_CHAT_TAG) if toolbar is not None else None
+        self.audio_options_stack.append(self.active and self.option("audio_toolbar")
+                                        and eye is not None and eye.getVisibility() == 0)
+
+    def hide_audio_chat_menu_item(self, param):
+        if self.audio_options_stack and self.audio_options_stack[-1] and param.args[1] == self.audio_menu_chat_icon:
+            param.setResult(param.thisObject)
+
+    def after_mini_audio_player(self, param):
+        if not (self.active and self.option("audio_toolbar")):
+            return
+        bar = param.thisObject
+        if self.set_mini_audio_speed(bar, True):
+            self.mini_audio_bars = [ref for ref in self.mini_audio_bars if ref.get() is not None]
+            if not any(ref.get() == bar for ref in self.mini_audio_bars):
+                self.mini_audio_bars.append(self.weak(bar))
+
+    def set_mini_audio_speed(self, bar, shown):
+        if bar.getCurrentStyle() != 0:  # FragmentContextView.STYLE_AUDIO_PLAYER
+            return False
+        message = self.mini_audio_message.get(bar)
+        speed = self.mini_audio_speed.get(bar)
+        if (message is None or not message.isMusic() or message.getDuration() >= 600
+                or speed is None or speed.getVisibility() != 0):
+            return False
+        if speed.isEnabled() == shown and speed.getAlpha() == float(shown):
+            return False
+        speed.setAlpha(float(shown))
+        speed.setEnabled(shown)
+        title = self.mini_audio_title.get(bar)
+        padding = self.mini_audio_join_width.getInt(bar) + (self.dp(44) if shown else 0)
+        title.setPadding(title.getPaddingLeft(), title.getPaddingTop(), padding, title.getPaddingBottom())
+        if shown:
+            self.mini_audio_update_speed.invoke(bar, self.object_args([self.boolean(False)]))
+        return True
+
+    def restore_mini_audio_speed(self):
+        for ref in self.mini_audio_bars:
+            bar = ref.get()
+            if bar is not None:
+                self.set_mini_audio_speed(bar, False)
+        self.mini_audio_bars.clear()
 
     def layout_audio_buttons(self, audio, timer):
         native = self.audio_native_buttons.get(audio)
@@ -263,6 +342,13 @@ class MediaSleepTimer(BasePlugin):
         timer.setVisibility(0 if use_timer else 8)
         if toolbar is None:
             return
+        message = self.controller.getPlayingMessageObject() if move_speed else None
+        if message is not None and speed is not None and speed.getVisibility() != 0:
+            # The native layout hides speed on tracks of ten minutes or less.
+            speed.setVisibility(0)
+        eye = toolbar.findViewWithTag(AUDIO_SHOW_IN_CHAT_TAG)
+        if eye is not None:
+            eye.setVisibility(0 if message is not None and message.getId() > 0 else 8)
         self.style_audio_track_icons(audio, toolbar, restore=not (use_timer or move_speed))
         if not (use_timer or move_speed) or toolbar.getWidth() <= 0:
             return
@@ -272,7 +358,6 @@ class MediaSleepTimer(BasePlugin):
 
         native_playback = tuple(native[index] for index in range(1, 6))
         playback = visible(native_playback)
-        tools = visible((native[0], speed if move_speed else None, timer, native[6]))
         play = native[3]
         if play not in playback:
             return
@@ -284,12 +369,15 @@ class MediaSleepTimer(BasePlugin):
         play_index = playback.index(play)
         slots = centered_audio_slots(row_width, padding, play_index, len(playback) - play_index - 1)
         self.layout_audio_line(playback, slots, inset, self.dp(29), native, speed, toolbar)
-        if move_speed and tools:
+        if move_speed:
+            tools = (native[0], speed, timer, eye, native[6])
             self.layout_audio_line(tools, audio_slots(row_width, padding, len(tools)),
                                    inset, self.dp(29 + AUDIO_ROW_HEIGHT), native, speed, toolbar)
 
     def layout_audio_line(self, buttons, slots, inset, center_y, native, speed, toolbar):
         for button, (left, right) in zip(buttons, slots):
+            if button is None or button.getParent() is None or button.getVisibility() != 0:
+                continue
             params = button.getLayoutParams()
             available = right - left
             width = min(params.width, available) if params.width >= 0 else available
@@ -370,6 +458,12 @@ class MediaSleepTimer(BasePlugin):
         timer.setBackground(self.theme.createSelectorDrawable(color & 0x19FFFFFF, 1, self.dp(18)))
         self.render_timer_control(timer, color, self.audio_timer_blue(), self.timer_label(None))
 
+    def color_audio_eye(self, audio, eye):
+        color = self.audio_title_color.get(audio).getCurrentTextColor()
+        eye = cast(self.image_view, eye)
+        eye.setColorFilter(color)
+        eye.setBackground(self.theme.createSelectorDrawable(color & 0x19FFFFFF, 1, self.dp(18)))
+
     def style_audio_track_icons(self, audio, toolbar, *, restore):
         if toolbar is None:
             return
@@ -402,26 +496,34 @@ class MediaSleepTimer(BasePlugin):
             timer = timer_ref.get()
             if timer is not None and audio_ref.get() == param.thisObject:
                 self.color_audio_clock(param.thisObject, timer)
-                self.style_audio_track_icons(param.thisObject, timer.getParent(),
+                toolbar = timer.getParent()
+                eye = toolbar.findViewWithTag(AUDIO_SHOW_IN_CHAT_TAG) if toolbar is not None else None
+                if eye is not None:
+                    self.color_audio_eye(param.thisObject, eye)
+                self.style_audio_track_icons(param.thisObject, toolbar,
                                              restore=not (self.option("timer") or self.option("audio_toolbar")))
 
     def audio_timer_blue(self):
         return VIDEO_TIMER_BLUE if self.theme.isCurrentThemeDark() else AUDIO_TIMER_BLUE
 
+    def add_timer_countdown(self, button, *, height=14, min_sp=10):
+        text = self.text_view(button.getContext())
+        text.setGravity(17)
+        text.setMaxLines(1)
+        text.setIncludeFontPadding(False)
+        text.setTextSize(12.0)
+        if self.sdk >= 26:
+            text.setAutoSizeTextTypeUniformWithConfiguration(min_sp, 12, 1, 2)
+        text.setImportantForAccessibility(2)
+        text.setVisibility(4)
+        button.addView(text, self.frame_params(-1, self.dp(height), 81))
+        return text
+
     def render_timer_control(self, button, normal, blue, label):
         icon = button.getChildAt(0)
-        if button.getChildCount() == 1 and label:
-            text = self.text_view(button.getContext())
-            text.setGravity(17)
-            text.setMaxLines(1)
-            text.setIncludeFontPadding(False)
-            text.setTextSize(12.0)
-            if self.sdk >= 26:
-                text.setAutoSizeTextTypeUniformWithConfiguration(10, 12, 1, 2)
-            text.setImportantForAccessibility(2)
-            params = self.frame_params(-1, self.dp(14), 81)
-            button.addView(text, params)
         text = button.getChildAt(1)
+        if text is None and label:
+            text = self.add_timer_countdown(button)
         if text is not None:
             text.setTextColor(blue)
             if str(text.getText()) != label:
@@ -454,16 +556,16 @@ class MediaSleepTimer(BasePlugin):
         return ("+" if self.waiting is not None else "") + format_timer_time(self.timer_seconds())
 
     def update_countdown(self):
-        for _, item_ref, viewer_ref in self.menus:
-            item, viewer = item_ref.get(), viewer_ref.get()
-            if item is not None and viewer is not None:
-                self.render_video_timer(item, viewer, self.timer_label(viewer))
         audio_label = self.timer_label(None)
         for audio_ref, timer_ref, _ in self.audio_rows:
             audio, timer = audio_ref.get(), timer_ref.get()
             if audio is not None and timer is not None:
                 color = self.audio_title_color.get(audio).getCurrentTextColor()
                 self.render_timer_control(timer, color, self.audio_timer_blue(), audio_label)
+        for _, item_ref, viewer_ref in self.menus:
+            item, viewer = item_ref.get(), viewer_ref.get()
+            if item is not None and viewer is not None:
+                self.render_video_timer(item, viewer, self.timer_label(viewer))
 
     def run_countdown(self):
         try:
@@ -617,12 +719,11 @@ class MediaSleepTimer(BasePlugin):
             slider_host = self.timer_layout(context)
             slider_host.setOrientation(1)
             add(slider_host, -2, 8)
-            palette = None
-            if not compact:
-                primary = self.timer_color(self.theme.key_dialogTextBlack, provider)
-                secondary = self.timer_color(self.theme.key_dialogTextGray2, provider)
-                accent = self.audio_timer_blue()
-                palette = (primary, secondary, accent, (primary & 0xFFFFFF) | 0x24000000, WHITE)
+            primary = self.timer_color(self.theme.key_dialogTextBlack, provider)
+            secondary = self.timer_color(self.theme.key_dialogTextGray2, provider)
+            accent = self.timer_color(self.theme.key_featuredStickers_addButton, provider)
+            track = (primary & 0xFFFFFF) | (0x42000000 if compact else 0x24000000)
+            palette = (primary, secondary, accent, track, WHITE)
 
             def repaint_slider():
                 values = timer_choices()
@@ -996,6 +1097,7 @@ class MediaSleepTimer(BasePlugin):
         def restore():
             self.clear()
             self.run_countdown()
+            self.restore_mini_audio_speed()
             self.dismiss_timer_ui()
             for _, row_ref, _ in self.menus:
                 row = row_ref.get()
@@ -1008,9 +1110,13 @@ class MediaSleepTimer(BasePlugin):
                     self.audio_layout.get(audio).removeOnLayoutChangeListener(listener)
                     if timer is not None:
                         self.style_audio_track_icons(audio, timer.getParent(), restore=True)
-                    self.update_audio_footer(audio, restore=self.option("hide_audio_profile_button"))
+                    self.update_audio_footer(audio, restore=True)
                 if timer is not None and timer.getParent() is not None:
-                    timer.getParent().removeView(timer)
+                    toolbar = timer.getParent()
+                    eye = toolbar.findViewWithTag(AUDIO_SHOW_IN_CHAT_TAG)
+                    if eye is not None:
+                        toolbar.removeView(eye)
+                    toolbar.removeView(timer)
             self.audio_rows.clear()
 
         run_on_ui_thread(restore)
