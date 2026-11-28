@@ -4,7 +4,7 @@
 
 A plugin for faster media browsing, better AyuGram filter integration, and more controls for the photo, video, and music players in NagramXF.
 
-**[Download the latest plugin](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [Release notes](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [Version history (简体中文)](CHANGELOG.md) · [Report an issue](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+**[Download the latest plugin](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [Documentation site](https://ztszts777.github.io/tgfastviewer-nagramxf/) · [Release notes](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [Version history (简体中文)](CHANGELOG.md) · [Report an issue](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
 
 ## Install or update
 

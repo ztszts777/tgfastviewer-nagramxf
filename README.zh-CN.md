@@ -4,7 +4,7 @@
 
 在 NagramXF 中更快地浏览聊天媒体、补齐 AyuGram 过滤后的显示，并调整照片、视频和音乐播放器。安装一个 `.plugin` 即可使用，功能可以按需开关。
 
-**[下载最新版插件](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [发布说明](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [版本记录](CHANGELOG.md) · [反馈问题](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+**[下载最新版插件](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [文档站](https://ztszts777.github.io/tgfastviewer-nagramxf/zh-cn/) · [发布说明](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [版本记录](CHANGELOG.md) · [反馈问题](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
 
 ## 安装与升级
 

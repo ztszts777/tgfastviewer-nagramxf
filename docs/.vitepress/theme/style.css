@@ -1,0 +1,27 @@
+:root {
+  --vp-c-brand-1: #2854c5;
+  --vp-c-brand-2: #315dca;
+  --vp-c-brand-3: #2348aa;
+  --vp-c-brand-soft: rgb(49 93 202 / 13%);
+  --vp-home-hero-name-color: #2348aa;
+}
+
+.dark {
+  --vp-c-brand-1: #a2baff;
+  --vp-c-brand-2: #7797f7;
+  --vp-c-brand-3: #4167d1;
+  --vp-c-brand-soft: rgb(119 151 247 / 18%);
+  --vp-home-hero-name-color: #a2baff;
+}
+
+.VPHero .tagline {
+  max-width: 34rem;
+}
+
+.VPFeature .details {
+  font-size: 1rem;
+}
+
+.VPFeature .link-text-icon {
+  display: none;
+}
