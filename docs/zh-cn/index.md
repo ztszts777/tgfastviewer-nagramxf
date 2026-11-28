@@ -1,14 +1,14 @@
 ---
 layout: home
-title: NagramXF 媒体增强
+title: NagramXF 增强
 hero:
   name: NagramXF
-  text: 媒体增强
+  text: 增强
   tagline: 更快浏览聊天媒体，自定义照片、视频和音乐播放器。
   actions:
     - theme: brand
       text: 下载插件
-      link: https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin
+      link: https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin
     - theme: alt
       text: 安装指南
       link: /zh-cn/installation

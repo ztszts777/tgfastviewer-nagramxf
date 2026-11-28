@@ -1,15 +1,15 @@
-# NagramXF Media Enhancements
+# NagramXF Enhancements
 
 **English** · [简体中文](README.zh-CN.md)
 
 A plugin for faster media browsing, better AyuGram filter integration, and more controls for the photo, video, and music players in NagramXF.
 
-**[Download the latest plugin](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [Documentation site](https://ztszts777.github.io/tgfastviewer-nagramxf/) · [Release notes](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [Version history (简体中文)](CHANGELOG.md) · [Report an issue](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+**[Download the latest plugin](https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin)** · [Documentation site](https://ztszts777.github.io/nagramxf-enhancements/) · [Release notes](https://github.com/ztszts777/nagramxf-enhancements/releases/latest) · [Version history (简体中文)](CHANGELOG.md) · [Report an issue](https://github.com/ztszts777/nagramxf-enhancements/issues)
 
 ## Install or update
 
 1. In NagramXF, open **N Settings → Plugins** and enable the plugin engine.
-2. Download `nagramxf_media_suite.plugin`, tap **+** in the Plugins screen, and import the file. Enable **NagramXF Media Enhancements**.
+2. Download `nagramxf_media_suite.plugin`, tap **+** in the Plugins screen, and import the file. Enable **NagramXF Enhancements**.
 3. If you already use the suite, choose **Update** when importing to keep your settings. Disable overlapping standalone plugins if you see duplicate controls.
 
 Requires **NagramXF 12.10.1 or newer** with the plugin engine. Version 1.7.0 passed regression tests and interface checks against **NagramXF 12.10.1.1251** (build `30dcd6c`, `arm64-v8a`). Settings switches were also tested on a phone. [Tested client build](https://github.com/Keeperorowner/NagramXF/releases/tag/1251)
@@ -43,10 +43,10 @@ The interface follows the Android system language by default. Select **English**
 - **Plugins menu missing** — Check that your NagramXF build includes the plugin engine and that the engine is enabled.
 - **Picture-in-picture unavailable** — Allow picture-in-picture for NagramXF in Android settings and enable **Android picture-in-picture** in the plugin.
 - **Duplicate controls** — Disable any standalone plugin that provides the same feature.
-- **Something else** — Include your NagramXF build, Android version, plugin version, affected settings, and steps to reproduce. [Report an issue](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+- **Something else** — Include your NagramXF build, Android version, plugin version, affected settings, and steps to reproduce. [Report an issue](https://github.com/ztszts777/nagramxf-enhancements/issues)
 
 ## Source and license
 
 The release asset is a readable Python `.plugin` file. The suite is generated from [the component sources](plugins/) and [the English translation catalog](plugins/i18n/en.json). Run `python tools/build_media_suite.py` from the repository root to rebuild `plugins/nagramxf_media_suite.plugin`.
 
-The suite is licensed under [GNU GPLv3](LICENSE) (`GPL-3.0-only`). TGFastViewer was created by **dunxuan**. The suite includes the original copyright and [full MIT notice](LICENSES/TGFastViewer-MIT.txt). The standalone [v1.0.1 adaptation](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.0.1) remains MIT-licensed. [Upstream TGFastViewer](https://github.com/dunxuan/tgfastviewer)
+The suite is licensed under [GNU GPLv3](LICENSE) (`GPL-3.0-only`). TGFastViewer was created by **dunxuan**. The suite includes the original copyright and [full MIT notice](LICENSES/TGFastViewer-MIT.txt). The standalone [v1.0.1 adaptation](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.0.1) remains MIT-licensed. [Upstream TGFastViewer](https://github.com/dunxuan/tgfastviewer)

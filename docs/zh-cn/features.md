@@ -1,6 +1,6 @@
 # 功能
 
-在插件列表打开「NagramXF 媒体增强」的设置，可按需开关各项功能。
+在插件列表打开「NagramXF Enhancements」的设置，可按需开关各项功能。
 
 ## 媒体浏览 {#media-browsing}
 

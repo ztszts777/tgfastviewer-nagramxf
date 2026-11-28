@@ -1,6 +1,6 @@
 # Features
 
-Open **NagramXF Media Enhancements** in the plugin list to configure individual features.
+Open **NagramXF Enhancements** in the plugin list to configure individual features.
 
 ## Media browsing {#media-browsing}
 

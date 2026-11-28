@@ -1,18 +1,18 @@
-# NagramXF 媒体增强
+# NagramXF 增强
 
 [English](README.md) · **简体中文**
 
 在 NagramXF 中更快地浏览聊天媒体、补齐 AyuGram 过滤后的显示，并调整照片、视频和音乐播放器。安装一个 `.plugin` 即可使用，功能可以按需开关。
 
-**[下载最新版插件](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)** · [文档站](https://ztszts777.github.io/tgfastviewer-nagramxf/zh-cn/) · [发布说明](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest) · [版本记录](CHANGELOG.md) · [反馈问题](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+**[下载最新版插件](https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin)** · [文档站](https://ztszts777.github.io/nagramxf-enhancements/zh-cn/) · [发布说明](https://github.com/ztszts777/nagramxf-enhancements/releases/latest) · [版本记录](CHANGELOG.md) · [反馈问题](https://github.com/ztszts777/nagramxf-enhancements/issues)
 
 ## 安装与升级
 
 1. 在 NagramXF 打开「N-设置 → 插件」，确认插件引擎已启用。
-2. 下载 `nagramxf_media_suite.plugin`，点插件页右上角的「＋」导入，然后启用「NagramXF 媒体增强」。
+2. 下载 `nagramxf_media_suite.plugin`，点插件页右上角的「＋」导入，然后启用「NagramXF Enhancements」。
 3. 已安装「NagramXF 媒体工具」或「NagramXF 插件合集」时，直接导入新版并选择更新，原有设置可继续使用。如果还装有同功能的旧版独立插件，请先禁用对应的独立插件。
 
-在「NagramXF 媒体增强」设置中，可按媒体浏览、播放器界面、播放手势、手势振动、全屏与旋转、音频与播控分别调整。
+在「NagramXF Enhancements」设置中，可按媒体浏览、播放器界面、播放手势、手势振动、全屏与旋转、音频与播控分别调整。
 
 ## 功能
 
@@ -20,7 +20,7 @@
 | --- | --- |
 | **TG 快点滑** | 从聊天或频道点开照片或视频时，优先加载当前位置附近的媒体。左右滑到已加载范围的边缘时继续补页，分页时保留完整相册。 |
 | **AyuGram 过滤显示修复** | 沿用当前聊天的 AyuGram 规则和排除设置。过滤后没有可见消息的日期会隐藏，聊天列表预览会尝试回落到最近一条可见消息。规则也应用于置顶栏、共享媒体、文件及全屏媒体的左右切换。 |
-| **过滤聊天的未读更新** | 在普通聊天点右下角箭头跳到最新位置，且已加载的最新消息被过滤时，使用客户端原生流程更新已读。跳到未读分隔线或取消跳转时沿用原有行为。 [v1.1.1 更新说明](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.1.1) |
+| **过滤聊天的未读更新** | 在普通聊天点右下角箭头跳到最新位置，且已加载的最新消息被过滤时，使用客户端原生流程更新已读。跳到未读分隔线或取消跳转时沿用原有行为。 [v1.1.1 更新说明](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.1.1) |
 | **照片与视频界面** | 横竖屏使用统一的顶栏与可展开说明。视频齿轮提供倍速、可用画质、播放模式和后台听视频。 |
 | **缩略图侧栏** | 横竖屏都可使用。点击小箭头展开或收起，拖动小箭头调整宽度或高度。默认收起，可改为默认展开，状态可按聊天或全局记忆。包含单媒体消息，按消息或聊天分隔，并沿滚动方向预载。 |
 | **共享媒体库** | 从查看器进入媒体库时，尽量将当前媒体移到可见范围中部，并用角标提示当前位置。返回会先回查看器，再回聊天中的消息位置。 |
@@ -55,7 +55,7 @@
 - **找不到插件入口**时，确认安装的是 NagramXF 插件版并启用了插件引擎。
 - **小窗无法打开**时，在 Android 系统设置中确认 NagramXF 获准使用画中画，并检查插件的「Android 系统小窗」开关。
 - **控件重复或功能冲突**时，在插件列表禁用同功能的旧版独立插件，再复试。
-- **提交问题**时，请附 NagramXF 的版本和构建号、Android 版本、插件版本、相关开关以及复现步骤。如果只在某类聊天或媒体中出现，也请一并注明。 [GitHub Issues](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+- **提交问题**时，请附 NagramXF 的版本和构建号、Android 版本、插件版本、相关开关以及复现步骤。如果只在某类聊天或媒体中出现，也请一并注明。 [GitHub Issues](https://github.com/ztszts777/nagramxf-enhancements/issues)
 
 ## 源码与构建
 
@@ -80,4 +80,4 @@ python tools/build_media_suite.py
 
 合集按 GNU GPLv3 发布，许可标识为 `GPL-3.0-only`。 [完整许可证](LICENSE)
 
-TGFastViewer 原作者为 **dunxuan**。合集保留原作者的版权声明和完整 MIT 文本，已按 MIT 发布的独立适配版 `v1.0.1` 继续适用原许可。 [上游项目](https://github.com/dunxuan/tgfastviewer) · [MIT 声明](LICENSES/TGFastViewer-MIT.txt) · [v1.0.1 旧版](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.0.1)
+TGFastViewer 原作者为 **dunxuan**。合集保留原作者的版权声明和完整 MIT 文本，已按 MIT 发布的独立适配版 `v1.0.1` 继续适用原许可。 [上游项目](https://github.com/dunxuan/tgfastviewer) · [MIT 声明](LICENSES/TGFastViewer-MIT.txt) · [v1.0.1 旧版](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.0.1)

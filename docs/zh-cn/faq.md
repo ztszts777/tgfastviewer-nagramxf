@@ -26,4 +26,4 @@
 
 ## 反馈问题需要提供什么？ {#report}
 
-请附上 NagramXF 版本和构建号、Android 版本、插件版本、相关设置及复现步骤。如果问题只出现在某种媒体或某个屏幕方向，也请一起注明。[提交反馈](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+请附上 NagramXF 版本和构建号、Android 版本、插件版本、相关设置及复现步骤。如果问题只出现在某种媒体或某个屏幕方向，也请一起注明。[提交反馈](https://github.com/ztszts777/nagramxf-enhancements/issues)

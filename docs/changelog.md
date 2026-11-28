@@ -1,6 +1,11 @@
 # Changelog
 
-This page summarizes major changes. The [full development history](/zh-cn/changelog) includes intermediate versions. Downloadable packages and individual release notes are listed on [GitHub Releases](https://github.com/ztszts777/tgfastviewer-nagramxf/releases).
+This page summarizes major changes. The [full development history](/zh-cn/changelog) includes intermediate versions. Downloadable packages and individual release notes are listed on [GitHub Releases](https://github.com/ztszts777/nagramxf-enhancements/releases).
+
+## v1.7.1 · Project rename {#v171}
+
+- The plugin list now displays **NagramXF Enhancements**.
+- The repository and documentation site moved to `nagramxf-enhancements`. The plugin ID and download filename are unchanged, so existing installations can update in place.
 
 ## v1.7.0 · Language and settings {#v170}
 
@@ -9,7 +14,7 @@ This page summarizes major changes. The [full development history](/zh-cn/change
 - Portrait thumbnails default to the bottom edge. Gesture haptics default to 60% strength and a cap of 30 pulses per second.
 - Includes fixes for disappearing seek bars after rotation and clipped lines in folded captions.
 
-[Read the v1.7.0 release notes](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.7.0)
+[Read the v1.7.0 release notes](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.7.0)
 
 ## v1.6.x · Filter previews and playback modes {#v16}
 

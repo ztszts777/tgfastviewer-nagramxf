@@ -5813,7 +5813,7 @@ for selected, looping in ((pip.VIDEO_PLAY_CONTINUOUS, False), (pip.VIDEO_PLAY_ST
 assert saved_modes == [True, False] and saved_looping == [False, True]
 
 suite_module = load("nagramxf_media_suite")
-assert suite_module.__name__ == "NagramXF 增强 · Enhancer"
+assert suite_module.__name__ == "NagramXF Enhancements"
 mode_suite = suite_module.NagramXFMediaSuite()
 mode_suite.get_capsule_ui = lambda: popup
 mode_order = (suite_module.VIDEO_PLAY_STOP, suite_module.VIDEO_PLAY_CONTINUOUS, suite_module.VIDEO_PLAY_LOOP)

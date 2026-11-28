@@ -7,9 +7,9 @@
 
 ## Install the plugin {#install}
 
-1. [Download `nagramxf_media_suite.plugin`](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin) from GitHub Releases.
+1. [Download `nagramxf_media_suite.plugin`](https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin) from GitHub Releases.
 2. In NagramXF, open **N Settings → Plugins** and enable the plugin engine.
-3. Tap **+**, select the downloaded file, and enable **NagramXF Media Enhancements**.
+3. Tap **+**, select the downloaded file, and enable **NagramXF Enhancements**.
 4. Open the plugin’s settings to select the [features](/features) you want.
 
 The plugin follows the Android system language by default. In **Plugin language**, choose **English** or **简体中文** to override it. Both languages are included in the same file.

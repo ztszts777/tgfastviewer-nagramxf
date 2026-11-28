@@ -7,9 +7,9 @@
 
 ## 安装插件 {#install}
 
-1. 从 GitHub Releases [下载 `nagramxf_media_suite.plugin`](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin)。
+1. 从 GitHub Releases [下载 `nagramxf_media_suite.plugin`](https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin)。
 2. 在 NagramXF 打开「N-设置 → 插件」，确认插件引擎已启用。
-3. 点击「＋」导入文件，启用「NagramXF 媒体增强」。
+3. 点击「＋」导入文件，启用「NagramXF Enhancements」。
 4. 打开插件设置，按需调整[功能](/zh-cn/features)。
 
 插件默认跟随 Android 系统语言。可在「插件语言」手动选择「简体中文」或「English」。两种语言包含在同一个插件文件中。

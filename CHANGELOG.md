@@ -2,6 +2,11 @@
 
 合集采用三段式版本号。成组新增或重做功能时升第二位，例如从 `1.1.x` 升到 `1.2.0`。同一功能阶段的小修递增最后一位。不兼容迁移时升第一位。
 
+## v1.7.1 · 统一项目名称
+
+- 插件列表中的名称改为「NagramXF Enhancements」。
+- GitHub 仓库和双语文档站改用 `nagramxf-enhancements`。插件 ID 与下载文件名保留，已有安装可直接更新。
+
 ## v1.7.0 · 默认设置与双语界面
 
 - 插件语言默认跟随 Android 系统语言，保留手动选择中文和英文。
@@ -292,9 +297,9 @@
 
 ## v1.1.0–v1.1.1 · 合集与过滤已读修复
 
-- [v1.1.0](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.1.0) 将 TG 快点滑、AyuGram 过滤显示和音视频工具合并为可独立开关的 GPLv3 插件合集，并保留原作者及 MIT 声明。修复画中画贴边收纳时自行切换播放状态。
-- [v1.1.1](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.1.1) 修复最新消息被过滤时，在聊天里跳到最新位置后未读数残留的问题。
+- [v1.1.0](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.1.0) 将 TG 快点滑、AyuGram 过滤显示和音视频工具合并为可独立开关的 GPLv3 插件合集，并保留原作者及 MIT 声明。修复画中画贴边收纳时自行切换播放状态。
+- [v1.1.1](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.1.1) 修复最新消息被过滤时，在聊天里跳到最新位置后未读数残留的问题。
 
 ## v1.0.1 · TG 快点滑独立插件
 
-- [v1.0.1](https://github.com/ztszts777/tgfastviewer-nagramxf/releases/tag/v1.0.1) 发布 NagramXF 内置插件版。从聊天打开媒体时优先加载附近记录，带完整 MIT 许可证和原作者署名。
+- [v1.0.1](https://github.com/ztszts777/nagramxf-enhancements/releases/tag/v1.0.1) 发布 NagramXF 内置插件版。从聊天打开媒体时优先加载附近记录，带完整 MIT 许可证和原作者署名。

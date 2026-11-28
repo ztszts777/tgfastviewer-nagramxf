@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitepress'
 
-const repository = 'https://github.com/ztszts777/tgfastviewer-nagramxf'
+const repository = 'https://github.com/ztszts777/nagramxf-enhancements'
 const download = repository + '/releases/latest/download/nagramxf_media_suite.plugin'
 
 const english = [
@@ -18,9 +18,9 @@ const chinese = [
 ]
 
 export default defineConfig({
-  base: '/tgfastviewer-nagramxf/',
-  title: 'NagramXF Media Enhancements',
-  description: 'Installation, features, and troubleshooting for the NagramXF media plugin.',
+  base: '/nagramxf-enhancements/',
+  title: 'NagramXF Enhancements',
+  description: 'Installation, features, and troubleshooting for the NagramXF enhancement suite.',
   lang: 'en',
   themeConfig: {
     search: {
@@ -63,8 +63,8 @@ export default defineConfig({
     'zh-cn': {
       label: '简体中文',
       lang: 'zh-CN',
-      title: 'NagramXF 媒体增强',
-      description: 'NagramXF 媒体增强插件的安装、功能与排障文档。',
+      title: 'NagramXF 增强',
+      description: 'NagramXF 增强插件的安装、功能与排障文档。',
       themeConfig: {
         nav: [...chinese, { text: '下载', link: download, noIcon: true }],
         sidebar: [{ text: '文档', items: chinese }],

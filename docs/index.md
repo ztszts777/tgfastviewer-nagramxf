@@ -1,14 +1,14 @@
 ---
 layout: home
-title: NagramXF Media Enhancements
+title: NagramXF Enhancements
 hero:
   name: NagramXF
-  text: Media Enhancements
+  text: Enhancements
   tagline: Browse chats faster and fine-tune the photo, video, and music players in NagramXF.
   actions:
     - theme: brand
       text: Download plugin
-      link: https://github.com/ztszts777/tgfastviewer-nagramxf/releases/latest/download/nagramxf_media_suite.plugin
+      link: https://github.com/ztszts777/nagramxf-enhancements/releases/latest/download/nagramxf_media_suite.plugin
     - theme: alt
       text: Installation guide
       link: /installation

@@ -15,10 +15,10 @@ from client_utils import RequestCallback
 from java import cast, dynamic_proxy, jarray, jbyte, jclass, jfloat, jint
 
 __id__ = "nagramxf_media_suite"
-__name__ = "NagramXF 增强 · Enhancer"
+__name__ = "NagramXF Enhancements"
 __description__ = "Media playback, filters and chat UI · 播放器、消息过滤与聊天界面"
 __author__ = "ztszts777 / TGFastViewer by dunxuan"
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 __app_version__ = ">=12.10.1"
 
 LANGUAGE_AUTO, LANGUAGE_CHINESE, LANGUAGE_ENGLISH = range(3)

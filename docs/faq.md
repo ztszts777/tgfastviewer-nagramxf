@@ -26,4 +26,4 @@ Set the double-tap seek interval in NagramXF. Use the plugin’s **Fullscreen an
 
 ## What should I include in a bug report? {#report}
 
-Include the NagramXF version and build, Android version, plugin version, enabled features, and steps to reproduce. If the issue occurs only with a particular media type or in one orientation, mention that too. [Report an issue](https://github.com/ztszts777/tgfastviewer-nagramxf/issues)
+Include the NagramXF version and build, Android version, plugin version, enabled features, and steps to reproduce. If the issue occurs only with a particular media type or in one orientation, mention that too. [Report an issue](https://github.com/ztszts777/nagramxf-enhancements/issues)
